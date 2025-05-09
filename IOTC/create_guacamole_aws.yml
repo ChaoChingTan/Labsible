@@ -1,0 +1,344 @@
+---
+## Before running playbook, ensure keypair labkey created
+## Download .pem file and name it labkey.pem
+## Ensure permission of labkey.pem is 0600
+
+- name: Create and Setup Guacamole server on AWS  
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars_files:
+    - vars/common.yml
+    - vars/guacamole.yml
+
+  tasks:
+    - name: Ensure {{ pemfile }} exists and has mode 0600
+      block:
+        - name: Check if {{ pemfile }} exists
+          stat:
+            path: "{{ pemfile }}"
+          register: pemfile_stat
+
+        - name: Fail if {{ pemfile }} does not exist
+          fail:
+            msg: "The file {{ pemfile }} does not exist!"
+          when: not pemfile_stat.stat.exists
+
+        - name: Fix mode of {{ pemfile }} if not 0600
+          file:
+            path: "{{ pemfile }}"
+            mode: '0600'
+          when: pemfile_stat.stat.exists and pemfile_stat.stat.mode != '0600'
+
+    - name: Fetch latest RHEL AMI
+      amazon.aws.ec2_ami_info:
+        region: "{{ aws_region }}"
+        owners: "309956199498"  # Red Hat's official AWS account ID
+        filters:
+          name: "RHEL-9.*-x86_64-*"
+          architecture: "x86_64"
+          root-device-type: "ebs"
+          virtualization-type: "hvm"
+      register: rhel_ami
+
+    - name: Select the latest AMI
+      set_fact:
+        latest_ami: "{{ (rhel_ami.images | sort(attribute='creation_date') | last).image_id }}"
+      when: rhel_ami.images | length > 0
+
+    - name: Display AMI ID
+      debug:
+        msg: "Latest RHEL AMI ID: {{ latest_ami }}"
+      when: latest_ami is defined
+
+    - name: Get VPC ID by Name
+      amazon.aws.ec2_vpc_net_info:
+        filters:
+          "tag:Name": "{{ vpc }}"
+      register: vpc_info
+
+    - name: Fail if VPC not found
+      fail:
+        msg: "VPC with name {{ vpc }} not found."
+      when: vpc_info.vpcs | length == 0
+
+    - name: Set fact for VPC ID
+      set_fact:
+        vpc_id: "{{ vpc_info.vpcs[0].id }}"
+
+    - name: Create security Group for Loadbalancer
+      amazon.aws.ec2_security_group:
+        name: "{{ alb_sg }}"
+        description: "Allow HTTPS"
+        region: "{{ aws_region }}"
+        vpc_id: "{{ vpc_id }}"
+        rules:
+          - proto: tcp
+            ports: [443]
+            cidr_ip: "0.0.0.0/0"
+      register: alb_sg_result
+
+    - name: Create security Group for Guacamole
+      amazon.aws.ec2_security_group:
+        name: "{{ guac_sg }}"
+        description: "Allow Guacamole Port"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ aws_region }}"
+        rules:
+          - proto: tcp
+            ports: [8080]
+            cidr_ip: "0.0.0.0/0"
+      register: guac_sg_result
+
+    - name: Create security Group for SSH
+      amazon.aws.ec2_security_group:
+        name: "{{ ssh_sg }}"
+        description: "Allow SSH Port"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ aws_region }}"
+        rules:
+          - proto: tcp
+            ports: [22]
+            cidr_ip: "0.0.0.0/0"
+      register: ssh_sg_result
+        
+    - name: Get subnets in the VPC
+      amazon.aws.ec2_vpc_subnet_info:
+        filters:
+          vpc-id: "{{ vpc_id }}"
+      register: subnet_info
+
+    - name: Find matching subnet
+      set_fact:
+        matching_subnet_id: "{{ item.id }}"
+      loop: "{{ subnet_info.subnets }}"
+      when: guac_ipaddr | ansible.utils.ipaddr(item.cidr_block)
+      # vars:
+      #   guac_subnet: "{{ item.cidr_block }}"
+      register: subnet_search
+
+    - name: Fail if no matching subnet found
+      fail:
+        msg: "No subnet found matching {{ guac_ipaddr }}"
+      when: subnet_search.results | selectattr('skipped', 'undefined') | list | length == 0
+
+    - name: Register the found Subnet ID
+      set_fact:
+        guac_subnet_id: "{{ subnet_search.results | selectattr('skipped', 'undefined') | map(attribute='ansible_facts.matching_subnet_id') | list | first }}"
+
+    - name: Debug the matched subnet
+      debug:
+        msg: "Matched subnet ID is {{ guac_subnet_id }}"
+
+    - name: Lookup Guac security group ID
+      amazon.aws.ec2_group_info:
+        filters:
+          group-name: "{{ guac_sg }}"
+        region: "{{ aws_region }}"
+      register: guac_sg_info
+
+    - name: Lookup SSH security group ID
+      amazon.aws.ec2_group_info:
+        filters:
+          group-name: "{{ ssh_sg }}"
+        region: "{{ aws_region }}"
+      register: ssh_sg_info
+
+    - name: Set security group ID facts
+      set_fact:
+        guac_sg_id: "{{ guac_sg_info.security_groups[0].group_id }}"
+        ssh_sg_id: "{{ ssh_sg_info.security_groups[0].group_id }}"
+
+    - name: Check if EC2 instance with name exists
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ guac_name }}"
+          instance-state-name: [ "pending", "running", "stopping", "stopped" ]
+      register: existing_instances
+
+    - name: Start EC2 instance with fixed private IP and public IP
+      amazon.aws.ec2_instance:
+        name: "{{ guac_name }}"
+        region: "{{ aws_region }}"
+        key_name: "{{ keyname }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ latest_ami }}"
+        network_interfaces:
+          - device_index: 0
+            subnet_id: "{{ guac_subnet_id }}"
+            private_ip_address: "{{ guac_ipaddr }}"
+            assign_public_ip: true
+        security_groups: 
+          - "{{ guac_sg_id }}"
+          - "{{ ssh_sg_id }}"
+        wait: yes
+        wait_timeout: 300
+        count: 1
+      register: guac_instance
+      when: existing_instances.instances | length == 0
+
+    - name: Check if instance exists by Name tag
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ guac_name }}"
+          "instance-state-name": "running"
+      register: guac_info
+
+    - name: Wait for public IP if instance was created
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "instance-id": "{{ guac_instance.instances[0].instance_id }}"
+      register: instance_info
+      until: instance_info.instances[0].public_ip_address is defined
+      retries: 10
+      delay: 5
+      when: guac_info.instances | length == 0
+
+
+    - name: Set instance_public_ip fact when instance existed
+      set_fact:
+        instance_public_ip: "{{ guac_info.instances[0].public_ip_address }}"
+      when: guac_info.instances | length > 0
+
+    - name: Set instance_public_ip fact when instance was just created
+      set_fact:
+        instance_public_ip: "{{ instance_info.instances[0].public_ip_address }}"
+      when: guac_info.instances | length == 0
+
+
+    - name: Display Instance Details
+      debug:
+        msg: "Public IP: {{ instance_public_ip }}"
+
+      
+    - name: Add new instance to inventory
+      add_host:
+        name: "guacamole-instance"
+        ansible_host: "{{ instance_public_ip }}"
+        ansible_user: ec2-user  # for RHEL, user is ec2-user
+        ansible_ssh_private_key_file: "{{ pemfile }}"
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+
+- name: Configure Guacamole server
+  hosts: "guacamole-instance"
+  gather_facts: no
+  tasks:
+    - name: Wait for instance to become reachable
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Install podman and pip
+      become: yes
+      ansible.builtin.package:
+        name:
+          - podman
+          - pip
+        state: present
+
+    - name: Install podman-compose python package
+      ansible.builtin.pip:
+        name: podman-compose
+
+    - name: Download SQL initialization file
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/ChaoChingTan/NoblePath/refs/heads/master/Labsible/guacamole/initdb.sql
+        dest: ./initdb.sql
+        mode: '0644'
+
+    - name: Create a podman network
+      containers.podman.podman_network:
+        name: guacamole-net
+        driver: bridge
+
+    - name: Ensure MySQL container present and create systemd unit file
+      containers.podman.podman_container:
+        name: mysql
+        image: docker.io/mysql
+        state: stopped
+        volume:
+          -  ./initdb.sql:/docker-entrypoint-initdb.d/initdb.sql:Z
+          - guac-mysql-data:/var/lib/mysql
+        env:
+          MYSQL_ROOT_PASSWORD: "password"
+          MYSQL_DATABASE: "guacamole_db"
+          MYSQL_USER: "guacamole"
+          MYSQL_PASSWORD: "password"
+        network:
+          - guacamole-net
+        generate_systemd:
+          path: ~/.config/systemd/user/
+          restart_policy: always
+        ports:
+          - "127.0.0.1:3306:3306"
+
+    - name: Ensure guacd container present and create systemd unit file
+      containers.podman.podman_container:
+        name: guacd
+        image: docker.io/guacamole/guacd
+        state: stopped
+        ports:
+          -  "4822:4822"
+        network:
+          - guacamole-net
+        generate_systemd:
+          path: ~/.config/systemd/user/
+          restart_policy: always
+          wants: container-mysql
+
+    - name: Ensure guacamole container present and create systemd unit file
+      containers.podman.podman_container:
+        name: guacamole
+        image: docker.io/guacamole/guacamole
+        state: stopped
+        ports:
+          -  "8080:8080"
+        env:
+          EXTENSION_PRIORITY: "mysql"
+          GUACD_HOSTNAME: "guacd"
+          MYSQL_HOSTNAME: "mysql"
+          MYSQL_PORT: "3306"
+          MYSQL_DATABASE: "guacamole_db"
+          MYSQL_USER: "guacamole"
+          MYSQL_PASSWORD: "password"
+        network:
+          - guacamole-net
+        generate_systemd:
+          path: ~/.config/systemd/user/
+          restart_policy: always
+
+    - name: mysql container must be started and enabled on systemd
+      ansible.builtin.systemd:
+        name: container-mysql
+        scope: user
+        daemon_reload: true
+        state: started
+        enabled: true
+
+    - name: guacd container must be started and enabled on systemd
+      ansible.builtin.systemd:
+        name: container-guacd
+        scope: user
+        daemon_reload: true
+        state: started
+        enabled: true
+
+    - name: guacamole container must be started and enabled on systemd
+      ansible.builtin.systemd:
+        name: container-guacamole
+        scope: user
+        daemon_reload: true
+        state: started
+        enabled: true
+
+    - name: Enable systemd lingering by creating the linger file
+      become: true
+      ansible.builtin.file:
+        path: /var/lib/systemd/linger/ec2-user
+        state: touch
+        owner: ec2-user
+        group: ec2-user
+        mode: '0644'
