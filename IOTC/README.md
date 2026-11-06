@@ -76,8 +76,7 @@ group: "34"
 
 Set the following variables in `vars/guacamole.yml`:
 ```
-guac_ipaddr: "10.0.0.34"
-guac_subnet: "10.0.0.0/24"
+guac_ipaddr: "10.0.0.30"
 ```
 `guac_ipaddr` is the internal ip address to allocate to the guacamole server.
 `guac_subnet` is the subnet CIDR range to which to create this server in.
@@ -86,16 +85,6 @@ Setup the guacamole instance on AWS
 ```bash
 ansible-playbook create_guacamole_aws.yml 
 ```
-
-### Create the clients
-
-After the guacamole server is up and running, you can create the clients for the users.
-```bash
-ansible-playbook launch_client_instances.yml
-```
-Register this guacamole server as the target for the appropriate target group. 
-Reset the password for the admin user `guacamole` or create a new admin user and delete the original default.
-
 
 ### Setup guacamole users and connections
 
@@ -112,6 +101,19 @@ ansible-playbook provisioning.yml
 Users should now be able to login their environment using the userid and password defined in `output/PAXX.csv` files.
 
 
+### Create the clients
+
+After the guacamole server is up and running, you can create the clients for the users. The playbook references the variables in the `vars/` folder including the `vars/clients.yml` file which contains the client configurations such as instance type and user data.
+
+```bash
+ansible-playbook launch_client_instances.yml
+```
+Register this guacamole server as the target for the appropriate target group. 
+Reset the password for the admin user `guacamole` or create a new admin user and delete the original default.
+
+
+
+
 ### Send notification emails
 
 This playbook uses AWS SES to send emails. As such you will need to setup credentials for SES.  Set the following environment variables.
@@ -120,6 +122,8 @@ This playbook uses AWS SES to send emails. As such you will need to setup creden
  export SMTP_USERNAME=AKIAXXXXXXXXXX
  export SMTP_PASSWORD=superSecurePasswordStringwhichisVeryLong
 ```
+
+**Note that some environments block outgoing SMTP, in which case you may have to switch to another network for this portion**
 
 Again the playbook relies on the `group` variable defined in `vars/common.yml` to send information based on the information on the appropriate `output/PAXX.csv` file. 
 
