@@ -88,7 +88,8 @@
         rules:
           - proto: tcp
             ports: [8080]
-            cidr_ip: "0.0.0.0/0"
+            ## cidr_ip: "0.0.0.0/0"
+            cidr_ip: "{{ vpc_cidr_ip }}"
       register: guac_sg_result
 
     - name: Create security Group for SSH
@@ -102,6 +103,18 @@
             ports: [22]
             cidr_ip: "0.0.0.0/0"
       register: ssh_sg_result
+
+    - name: Create security Group for RDP
+      amazon.aws.ec2_security_group:
+        name: "{{ rdp_sg }}"
+        description: "Allow RDP Port"
+        vpc_id: "{{ vpc_id }}"
+        region: "{{ aws_region }}"
+        rules:
+          - proto: tcp
+            ports: [3389]
+            cidr_ip: "0.0.0.0/0"
+      register: rdp_sg_result
         
     - name: Get subnets in the VPC
       amazon.aws.ec2_vpc_subnet_info:
@@ -154,13 +167,14 @@
       amazon.aws.ec2_instance_info:
         region: "{{ aws_region }}"
         filters:
-          "tag:Name": "{{ guac_name }}"
+          "tag:Name": "guacamole_PA{{ group }}"
           instance-state-name: [ "pending", "running", "stopping", "stopped" ]
       register: existing_instances
 
     - name: Start EC2 instance with fixed private IP and public IP
       amazon.aws.ec2_instance:
-        name: "{{ guac_name }}"
+        ##name: "{{ guac_name }}"
+        name: "guacamole_PA{{ group }}"
         region: "{{ aws_region }}"
         key_name: "{{ keyname }}"
         instance_type: "{{ instance_type }}"
@@ -183,7 +197,7 @@
       amazon.aws.ec2_instance_info:
         region: "{{ aws_region }}"
         filters:
-          "tag:Name": "{{ guac_name }}"
+          "tag:Name": "guacamole_PA{{ group }}"
           "instance-state-name": "running"
       register: guac_info
 
