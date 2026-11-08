@@ -1,0 +1,102 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  10-database (ephemeral, per session). Single-AZ RDS PostgreSQL for Guacamole.
+  Master credentials come from the permanent DbSecret in 02-platform, so a
+  recreated database and the web nodes always agree. When the stack is deleted,
+  RDS keeps a final snapshot as a safety net behind the SQL dump in S3.
+  Requires 01-network and 02-platform.
+
+Parameters:
+  LabPrefix:
+    Type: String
+    Default: lab
+    Description: Prefix for resource names and export names. Must match the other stacks.
+    AllowedPattern: "[a-z][a-z0-9-]{1,15}"
+
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    Description: RDS instance class. The database only serves logins and connection lookups.
+    AllowedPattern: '^db\.[a-z0-9]+\.[a-z0-9]+$'
+
+  EngineVersion:
+    Type: String
+    Default: "16"
+    Description: >
+      PostgreSQL version. A major version alone lets RDS choose the current default
+      minor. Use a full version (for example 16.4) to pin it.
+
+  AllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 200
+    Description: Storage in GB (gp3).
+
+  MultiAz:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Single-AZ is enough for this lab. A DB outage only blocks new logins.
+
+  DbName:
+    Type: String
+    Default: guacamole_db
+    AllowedPattern: "[a-z][a-z0-9_]{0,62}"
+    Description: Database name Guacamole connects to.
+
+Resources:
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Guacamole database subnets (the two ALB subnets)
+      SubnetIds: !Split [",", { "Fn::ImportValue": !Sub "${LabPrefix}-AlbSubnetIds" }]
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-db-subnets" }
+        - { Key: Lab, Value: guac }
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: postgres
+      EngineVersion: !Ref EngineVersion
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: !Ref AllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: !Ref MultiAz
+      DBName: !Ref DbName
+      MasterUsername: !Join
+        - ""
+        - - "{{resolve:secretsmanager:"
+          - { "Fn::ImportValue": !Sub "${LabPrefix}-DbSecretArn" }
+          - ":SecretString:username}}"
+      MasterUserPassword: !Join
+        - ""
+        - - "{{resolve:secretsmanager:"
+          - { "Fn::ImportValue": !Sub "${LabPrefix}-DbSecretArn" }
+          - ":SecretString:password}}"
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - { "Fn::ImportValue": !Sub "${LabPrefix}-DbSgId" }
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+      CopyTagsToSnapshot: true
+      DeletionProtection: false
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-guac-db" }
+        - { Key: Lab, Value: guac }
+
+Outputs:
+  DbEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+    Export: { Name: !Sub "${LabPrefix}-DbEndpoint" }
+  DbPort:
+    Value: !GetAtt Database.Endpoint.Port
+    Export: { Name: !Sub "${LabPrefix}-DbPort" }
+  DbName:
+    Value: !Ref DbName
+    Export: { Name: !Sub "${LabPrefix}-DbName" }
