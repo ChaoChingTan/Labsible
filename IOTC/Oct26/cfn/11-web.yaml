@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  11-web (ephemeral, per session). Guacamole web tier: an Auto Scaling group of at
+  least two Amazon Linux nodes (one per AZ) running the Guacamole web app in Docker,
+  behind the permanent ALB from 02-platform. Nodes read the database credentials from
+  Secrets Manager at boot. guacd is NOT here: each class stack has its own guacd pool,
+  and the per-connection proxy hostname stored in the database points at it.
+  Requires 01-network, 02-platform and 10-database.
+
+Parameters:
+  LabPrefix:
+    Type: String
+    Default: lab
+    Description: Prefix for resource names and export names. Must match the other stacks.
+    AllowedPattern: "[a-z][a-z0-9-]{1,15}"
+
+  WebInstanceType:
+    Type: String
+    Default: c6i.large
+    Description: Web nodes only serve the login page and connection lookups. x86 only.
+    AllowedPattern: '^[a-z0-9]+\.[a-z0-9]+$'
+
+  WebMinSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Minimum web nodes. 2 keeps one node in each of the two AZs.
+
+  WebMaxSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Maximum web nodes. Raise only if the web tier proves to be a bottleneck.
+
+  GuacamoleImage:
+    Type: String
+    Default: guacamole/guacamole:1.6.0
+    Description: Pinned image tag. Change it deliberately, never use latest.
+    AllowedPattern: '^[a-z0-9./_-]+:[A-Za-z0-9._-]+$'
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Amazon Linux 2023 (x86_64), resolved at deploy time.
+
+Resources:
+  # ------------------------------------------------------------ Launch template
+  # Bash variables below are written as $NAME (no braces) because this block goes
+  # through Fn::Sub, where ${...} would be read as a CloudFormation reference.
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${LabPrefix}-web"
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref WebInstanceType
+        IamInstanceProfile:
+          Arn: { "Fn::ImportValue": !Sub "${LabPrefix}-WebInstanceProfileArn" }
+        # No NAT in this design, so the node needs a public IP to pull the image.
+        # Inbound is still limited to the ALB by the security group.
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - { "Fn::ImportValue": !Sub "${LabPrefix}-GuacSgId" }
+        # IMDSv2 only, hop limit 1 so containers cannot reach the node's role.
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 16
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${LabPrefix}-web" }
+              - { Key: Lab, Value: guac }
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              - |
+                #!/bin/bash
+                set -euo pipefail
+                exec > >(tee -a /var/log/lab-web-boot.log /dev/console) 2>&1
+                echo "lab-web: start $(date -u +%FT%TZ)"
+
+                dnf install -y docker
+                systemctl enable --now docker
+
+                # Database credentials from Secrets Manager (never in the template).
+                SECRET=$(aws secretsmanager get-secret-value --region ${AWS::Region} \
+                  --secret-id ${DbSecretArn} --query SecretString --output text)
+                DB_USER=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["username"])' "$SECRET")
+                DB_PASS=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["password"])' "$SECRET")
+
+                umask 077
+                cat > /etc/guacamole.env <<EOF
+                POSTGRESQL_HOSTNAME=${DbEndpoint}
+                POSTGRESQL_PORT=${DbPort}
+                POSTGRESQL_DATABASE=${DbName}
+                POSTGRESQL_USER=$DB_USER
+                POSTGRESQL_PASSWORD=$DB_PASS
+                POSTGRESQL_SSL_MODE=require
+                GUACD_HOSTNAME=127.0.0.1
+                REMOTE_IP_VALVE_ENABLED=true
+                WEBAPP_CONTEXT=ROOT
+                EOF
+                unset SECRET DB_PASS
+
+                docker run -d --name guacamole --restart unless-stopped \
+                  --env-file /etc/guacamole.env -p 8080:8080 ${GuacamoleImage}
+                echo "lab-web: done $(date -u +%FT%TZ)"
+              - DbSecretArn: { "Fn::ImportValue": !Sub "${LabPrefix}-DbSecretArn" }
+                DbEndpoint: { "Fn::ImportValue": !Sub "${LabPrefix}-DbEndpoint" }
+                DbPort: { "Fn::ImportValue": !Sub "${LabPrefix}-DbPort" }
+                DbName: { "Fn::ImportValue": !Sub "${LabPrefix}-DbName" }
+
+  # ------------------------------------------------------- Target group + rule
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${LabPrefix}-web"
+      VpcId: { "Fn::ImportValue": !Sub "${LabPrefix}-VpcId" }
+      Protocol: HTTP
+      Port: 8080
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: "200" }
+      TargetGroupAttributes:
+        - { Key: stickiness.enabled, Value: "true" }
+        - { Key: stickiness.type, Value: lb_cookie }
+        - { Key: stickiness.lb_cookie.duration_seconds, Value: "86400" }
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+      Tags:
+        - { Key: Lab, Value: guac }
+
+  # Forward only requests for the lab hostname. Anything else keeps the listener's
+  # fixed 503 default from 02-platform.
+  WebListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: { "Fn::ImportValue": !Sub "${LabPrefix}-HttpsListenerArn" }
+      Priority: 10
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values: [{ "Fn::ImportValue": !Sub "${LabPrefix}-DomainName" }]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+  # ------------------------------------------------------------ Auto Scaling
+  WebAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: false
+    Properties:
+      AutoScalingGroupName: !Sub "${LabPrefix}-web"
+      MinSize: !Ref WebMinSize
+      MaxSize: !Ref WebMaxSize
+      DesiredCapacity: !Ref WebMinSize
+      VPCZoneIdentifier: !Split [",", { "Fn::ImportValue": !Sub "${LabPrefix}-GuacSubnetIds" }]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: [!Ref WebTargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-web", PropagateAtLaunch: false }
+        - { Key: Lab, Value: guac, PropagateAtLaunch: true }
+
+Outputs:
+  WebTargetGroupArn:
+    Value: !Ref WebTargetGroup
+    Export: { Name: !Sub "${LabPrefix}-WebTargetGroupArn" }
+  WebAsgName:
+    Value: !Ref WebAsg
+    Export: { Name: !Sub "${LabPrefix}-WebAsgName" }
