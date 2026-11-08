@@ -13,7 +13,8 @@ Browser-based Kali Linux labs on AWS: Apache Guacamole behind an ALB connects to
 | `cfn/02-platform.yaml` | Deployed as stack `lab-platform` in ap-southeast-1. |
 | `cfn/03-storage.yaml` | Deployed as stack `lab-storage`; notes published; read-only policy applied by `scripts/apply-notes-policy.sh`. Read-only behaviour on a Kali client not yet verified (needs `20-class`). |
 | `ami/kali-firstboot.sh` | Written. Logic tested manually on a Kali instance. Not yet run through cloud-init. |
-| `cfn/10-database.yaml` | Written, passes `cfn-lint`. Not yet deployed. Ephemeral (per session). |
+| `cfn/10-database.yaml` | Deployed as stack `lab-database`. Ephemeral (per session). |
+| `cfn/11-web.yaml` | Deployed as stack `lab-web`; both targets healthy; Guacamole shows an error page until the database schema is loaded. Ephemeral (per session). |
 
 ## Repo layout
 
@@ -23,9 +24,12 @@ cfn/
   02-platform.yaml   ALB, ACM cert, Route53 record, S3 dump bucket, secrets, IAM
   03-storage.yaml    EFS for read-only lecture notes, mount targets, notes admin role
   10-database.yaml   RDS PostgreSQL for Guacamole (ephemeral, per session)
+  11-web.yaml        Guacamole web ASG, target group, ALB listener rule (ephemeral, per session)
 ami/
   kali-firstboot.sh  user-data for Kali instances (password, compositor, hostname, notes mount)
 scripts/
+  db-run.sh               runs db tasks (init / restore / dump) on a web node via SSM
+  node/db-node.sh         the task itself; runs on the web node
   apply-notes-policy.sh   applies the read-only EFS policy after 03-storage is deployed
 params/
   lab.env.example    template for local, git-ignored deployment settings
@@ -383,3 +387,85 @@ aws rds describe-db-snapshots --region "$AWS_REGION" --snapshot-type manual \
 ```
 
 Snapshots cost storage until deleted.
+
+---
+
+## 11-web.yaml
+
+Ephemeral stack. Requires `lab-network`, `lab-platform` and `lab-database`. Delete it before `lab-database`.
+
+### Design decisions
+
+- **Docker on stock Amazon Linux 2023.** The node installs Docker at boot and runs one pinned `guacamole/guacamole` container. No custom AMI yet.
+- **No guacd here.** Each class stack has its own guacd pool. The container still requires `GUACD_HOSTNAME` to start, so it is set to an unused `127.0.0.1`; the per-connection proxy hostname stored in the database (set by the sync script) is what actually routes sessions.
+- **Two nodes, one per AZ,** behind the permanent ALB. Target group uses a load-balancer cookie for stickiness so a user's requests stay on one node.
+- **Database credentials are fetched from Secrets Manager at boot** and written to `/etc/guacamole.env` (mode 600). Nothing sensitive is in the template.
+- **TLS to the database is required** (`POSTGRESQL_SSL_MODE=require`), as current RDS PostgreSQL versions enforce SSL.
+- **IMDSv2 only with hop limit 1,** so the container cannot obtain the node's IAM role credentials.
+- **Public IP on the node** (no NAT) so it can pull the image; inbound is limited to the ALB by `lab-guac-sg`.
+- **The ALB rule forwards only the lab hostname.** Other requests keep the 503 default.
+
+### Resources
+
+| Resource | Detail |
+|---|---|
+| Launch template | AL2023 (SSM-resolved AMI), `c6i.large`, 16 GB encrypted gp3, `lab-guac-sg`, web instance profile |
+| Auto Scaling group | min 2 / max 2 across the two guac subnets, ELB health checks, rolling update |
+| Target group | HTTP 8080, health check `/` expecting 200, cookie stickiness, 30 s deregistration delay |
+| Listener rule | Priority 10 on the HTTPS listener, host header = the lab domain |
+
+### Parameters
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `LabPrefix` | `lab` | Must match the other stacks |
+| `WebInstanceType` | `c6i.large` | x86 only |
+| `WebMinSize` / `WebMaxSize` | `2` / `2` | |
+| `GuacamoleImage` | `guacamole/guacamole:1.6.0` | Pinned; version documented in the Guacamole manual |
+| `AmiId` | SSM path for AL2023 x86_64 | Resolved at deploy time |
+
+### Exports
+
+`lab-WebTargetGroupArn`, `lab-WebAsgName`
+
+### Deploy
+
+```bash
+source params/lab.env
+
+aws cloudformation deploy \
+  --region "$AWS_REGION" \
+  --stack-name lab-web \
+  --template-file cfn/11-web.yaml
+```
+
+### Verify after deploy
+
+1. Targets become `healthy`: `aws elbv2 describe-target-health --region "$AWS_REGION" --target-group-arn $(aws cloudformation list-exports --region "$AWS_REGION" --query "Exports[?Name=='lab-WebTargetGroupArn'].Value" --output text)`
+2. Boot log on a node (via SSM Session Manager): `/var/log/lab-web-boot.log`, then `sudo docker logs guacamole`.
+3. Opening the lab domain in a browser shows the Guacamole page. The database is still empty at this point, so login will not work until the schema is initialised or a dump is restored (next step, not yet built).
+
+### Teardown
+
+```bash
+aws cloudformation delete-stack --region "$AWS_REGION" --stack-name lab-web
+```
+
+---
+
+## Database tasks (`scripts/db-run.sh`)
+
+Run from your machine. The script picks one in-service web node, runs the task there through SSM Session Manager's run-command (the web nodes are the only machines that can reach the database), then restarts Guacamole on all web nodes. Run it once per session, after `lab-web` is up.
+
+```bash
+source params/lab.env
+scripts/db-run.sh init                    # empty database: load schema, set guacadmin password
+scripts/db-run.sh restore [file-name]     # empty database: restore newest (or named) dump, set guacadmin password
+scripts/db-run.sh dump                    # write s3://<dump bucket>/dumps/guacamole-<timestamp>.sql.gz
+```
+
+- `init` and `restore` refuse to run if the database already has tables.
+- The `guacadmin` password is set from the permanent `GuacAdminSecret` after every init or restore. Read it with `aws secretsmanager get-secret-value --secret-id <GuacAdminSecretArn> --query SecretString --output text`.
+- Dumps use `pg_dump --no-owner --no-acl` (this database only).
+- The web role needs read access to `GuacAdminSecret`; redeploy `lab-platform` after pulling this change (`--capabilities CAPABILITY_IAM`).
+- Status: written, not yet tested. Schema creation relies on the container's `initdb.sh --postgresql`.
