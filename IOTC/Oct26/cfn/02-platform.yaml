@@ -23,11 +23,6 @@ Parameters:
     Type: AWS::Route53::HostedZone::Id
     Description: Route53 hosted zone that serves DomainName. Supplied at deploy time.
 
-  KaliRdpUsername:
-    Type: String
-    Default: kali
-    Description: Shared RDP username baked into the Kali image.
-
 Resources:
   # ------------------------------------------------------------- Certificate
   Certificate:
@@ -180,22 +175,12 @@ Resources:
       Tags:
         - { Key: Lab, Value: guac }
 
-  KaliRdpSecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Description: Shared RDP login on the Kali image (stored in Guacamole connection parameters)
-      GenerateSecretString:
-        SecretStringTemplate: !Sub '{"username":"${KaliRdpUsername}"}'
-        GenerateStringKey: password
-        PasswordLength: 24
-        ExcludePunctuation: true
-      Tags:
-        - { Key: Lab, Value: guac }
-
   # --------------------------------------------------------------------- IAM
   # Web nodes: SSM shell, CloudWatch, read the DB secret, read/write the dump
-  # bucket. The Guacamole admin and Kali secrets are read by the operator running
-  # the roster sync, not by the nodes. Kali instances get NO role.
+  # bucket. The Guacamole admin secret is read by the operator running the roster
+  # sync, not by the nodes. Kali instances get NO role. The Kali desktop login is
+  # the fixed kali/kali account: it is reachable only from the guacd security group,
+  # and each student's unique Guacamole password is the gatekeeper.
   WebRole:
     Type: AWS::IAM::Role
     Properties:
@@ -268,9 +253,6 @@ Outputs:
   GuacAdminSecretArn:
     Value: !Ref GuacAdminSecret
     Export: { Name: !Sub "${LabPrefix}-GuacAdminSecretArn" }
-  KaliRdpSecretArn:
-    Value: !Ref KaliRdpSecret
-    Export: { Name: !Sub "${LabPrefix}-KaliRdpSecretArn" }
   WebInstanceProfileArn:
     Value: !GetAtt WebInstanceProfile.Arn
     Export: { Name: !Sub "${LabPrefix}-WebInstanceProfileArn" }

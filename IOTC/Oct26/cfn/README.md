@@ -151,6 +151,7 @@ Permanent stack. Public entry point and shared services. Requires `lab-network`.
 - **The ALB is permanent and returns a friendly 503** until a web stack attaches. The web stack later adds its own target group and a listener rule, so the ALB, certificate and DNS never change between sessions.
 - **No hardcoded domain or zone.** `DomainName` and `HostedZoneId` are required parameters with no defaults, supplied from `params/lab.env` at deploy time.
 - **Secrets are permanent** (Secrets Manager, generated passwords), so a recreated database and the web nodes always agree after a restore.
+- **No secret for the Kali desktop login.** It is the fixed `kali`/`kali` account. RDP is reachable only from the guacd security group, and each student's unique Guacamole password is the gatekeeper.
 - **Least privilege per role.** Web nodes can read the DB secret and read/write the dump bucket. guacd nodes get SSM and CloudWatch only. Kali instances get no role.
 
 ### Resources
@@ -163,7 +164,7 @@ Permanent stack. Public entry point and shared services. Requires `lab-network`.
 | HTTP listener (80) | 301 redirect to HTTPS |
 | Route53 record | A alias for `DomainName` pointing at the ALB |
 | S3 bucket `lab-dumps-<account>-<region>` | Versioned, SSE-S3, public access blocked, TLS-only policy, `Retain` on stack deletion. Old versions expire after 90 days. |
-| Secrets | `DbSecret` (user `guacamole`), `GuacAdminSecret` (user `guacadmin`), `KaliRdpSecret` (shared Kali RDP login) |
+| Secrets | `DbSecret` (user `guacamole`), `GuacAdminSecret` (user `guacadmin`) |
 | IAM | `WebRole`/`WebInstanceProfile`, `GuacdRole`/`GuacdInstanceProfile` |
 
 ### Parameters
@@ -173,11 +174,10 @@ Permanent stack. Public entry point and shared services. Requires `lab-network`.
 | `LabPrefix` | `lab` | Must match `01-network` |
 | `DomainName` | none | Lab hostname. Supplied at deploy time. |
 | `HostedZoneId` | none | Route53 zone serving the hostname. Supplied at deploy time. |
-| `KaliRdpUsername` | `kali` | Shared RDP username in the Kali image |
 
 ### Exports
 
-`lab-DomainName`, `lab-HttpsListenerArn`, `lab-DumpBucketName`, `lab-DbSecretArn`, `lab-GuacAdminSecretArn`, `lab-KaliRdpSecretArn`, `lab-WebInstanceProfileArn`, `lab-GuacdInstanceProfileArn`
+`lab-DomainName`, `lab-HttpsListenerArn`, `lab-DumpBucketName`, `lab-DbSecretArn`, `lab-GuacAdminSecretArn`, `lab-WebInstanceProfileArn`, `lab-GuacdInstanceProfileArn`
 
 ### Deploy
 
