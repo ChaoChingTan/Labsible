@@ -10,7 +10,9 @@ Browser-based Kali Linux labs on AWS: Apache Guacamole behind an ALB connects to
 | Component | State |
 |---|---|
 | `cfn/01-network.yaml` | Deployed as stack `lab-network` in ap-southeast-1. |
-| `cfn/02-platform.yaml` | Written, passes `cfn-lint`. Not yet deployed. |
+| `cfn/02-platform.yaml` | Deployed as stack `lab-platform` in ap-southeast-1. |
+| `cfn/03-storage.yaml` | Deployed as stack `lab-storage`; notes published; read-only policy applied by `scripts/apply-notes-policy.sh`. Read-only behaviour on a Kali client not yet verified (needs `20-class`). |
+| `ami/kali-firstboot.sh` | Written. Logic tested manually on a Kali instance. Not yet run through cloud-init. |
 
 ## Repo layout
 
@@ -18,6 +20,11 @@ Browser-based Kali Linux labs on AWS: Apache Guacamole behind an ALB connects to
 cfn/
   01-network.yaml    VPC, subnets, routing, security groups
   02-platform.yaml   ALB, ACM cert, Route53 record, S3 dump bucket, secrets, IAM
+  03-storage.yaml    EFS for read-only lecture notes, mount targets, notes admin role
+ami/
+  kali-firstboot.sh  user-data for Kali instances (password, compositor, hostname, notes mount)
+scripts/
+  apply-notes-policy.sh   applies the read-only EFS policy after 03-storage is deployed
 params/
   lab.env.example    template for local, git-ignored deployment settings
 .gitignore
@@ -207,3 +214,103 @@ Certificate validation can take a few minutes while the stack is `CREATE_IN_PROG
 
 - Keep termination protection on. Deleting this stack deletes the secrets, which would no longer match a restored database.
 - Retrieve a password with `aws secretsmanager get-secret-value --secret-id <arn> --query SecretString --output text`.
+
+---
+
+## 03-storage.yaml
+
+Permanent stack. An EFS file system holding the lecture notes that every Kali mounts read-only at `~/Desktop/notes`. Requires `lab-network` and `lab-platform`.
+
+### Design decisions
+
+- **Read-only is enforced by EFS, not by the client.** Students have root on their Kali, so a `ro` mount option alone could be undone with `mount -o remount,rw`. The file system policy allows `ClientMount` (read-only) to every NFS client, and `ClientWrite` plus `ClientRootAccess` only to the notes admin role (without root access, root on the admin instance is squashed and cannot write to the root-owned top level of the file system).
+- **The policy is applied by a script**, `scripts/apply-notes-policy.sh`, because a policy inside this template cannot reference the file system's own ARN.
+- **Kali needs no IAM role.** It mounts anonymously over NFS, so EFS cannot tell students apart. This is fine for shared, read-only notes. It is not suitable for private per-student files.
+- **Master copy lives in S3** (`s3://<dump bucket>/notes/`), so the file system can always be rebuilt.
+- **One mount target per AZ**, in the class subnets. This requires the three class subnets to be in three different AZs (the `01-network` default).
+
+### Resources
+
+| Resource | Detail |
+|---|---|
+| EFS file system `lab-notes` | Encrypted, Elastic throughput, automatic backups on |
+| Mount targets | One in each class subnet, security group `lab-efs-sg` |
+| `lab-efs-sg` | 2049 from `lab-client-sg` and the notes admin SG |
+| `lab-notes-admin-sg` | No inbound rules; managed through SSM |
+| `NotesAdminRole` / instance profile | SSM, EFS read/write on this file system, S3 read on `notes/` in the dump bucket |
+
+### Parameters
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `LabPrefix` | `lab` | Must match the other stacks |
+| `Class1` / `Class2` / `Class3` | `31` / `32` / `33` | Must match `01-network` |
+
+### Exports
+
+`lab-NotesFileSystemId`, `lab-NotesAdminRoleArn`, `lab-NotesAdminInstanceProfileArn`, `lab-NotesAdminSgId`
+
+### Deploy
+
+```bash
+source params/lab.env
+
+aws cloudformation deploy \
+  --region "$AWS_REGION" \
+  --stack-name lab-storage \
+  --template-file cfn/03-storage.yaml \
+  --capabilities CAPABILITY_IAM
+
+scripts/apply-notes-policy.sh
+
+aws cloudformation update-termination-protection \
+  --region "$AWS_REGION" --stack-name lab-storage --enable-termination-protection
+```
+
+### Publish or update the notes
+
+1. Find the dump bucket name (created by `02-platform`; it contains your account ID, so it is not written here) and copy the notes to its `notes/` prefix from your own machine (the master copy):
+   ```bash
+   source params/lab.env
+   BUCKET=$(aws cloudformation list-exports --region "$AWS_REGION" \
+     --query "Exports[?Name=='lab-DumpBucketName'].Value" --output text)
+   aws s3 sync ./your-lecture-notes/ "s3://$BUCKET/notes/"
+   ```
+2. Launch a short-lived Amazon Linux 2023 instance and connect with SSM Session Manager. Settings: `t3.micro`; subnet `lab-guac-a` (first entry of the `lab-GuacSubnetIds` export) with a public IP (needed for the SSM agent, since there is no NAT); security group `lab-notes-admin-sg` (export `lab-NotesAdminSgId`, no inbound rules); instance profile from export `lab-NotesAdminInstanceProfileArn`; no key pair; IMDSv2 required with hop limit 1; tags `Name=notes-admin`, `Lab=guac`. Example:
+   ```bash
+   source params/lab.env; R=$AWS_REGION
+   x() { aws cloudformation list-exports --region $R --query "Exports[?Name=='$1'].Value" --output text; }
+   AMI=$(aws ssm get-parameter --region $R --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query Parameter.Value --output text)
+   aws ec2 run-instances --region $R --image-id $AMI --instance-type t3.micro \
+     --subnet-id "$(x lab-GuacSubnetIds | cut -d, -f1)" \
+     --security-group-ids "$(x lab-NotesAdminSgId)" \
+     --iam-instance-profile Arn="$(x lab-NotesAdminInstanceProfileArn)" \
+     --associate-public-ip-address \
+     --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1 \
+     --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=notes-admin},{Key=Lab,Value=guac}]' \
+     --query 'Instances[0].InstanceId' --output text
+   aws ssm start-session --region $R --target <instance-id>   # needs the Session Manager plugin
+   ```
+3. On that Amazon Linux instance (hence `dnf`; the Kali instances mount over plain NFS with `nfs-common` and do not need `amazon-efs-utils`), set the bucket name and file system ID (the instance's role cannot look them up; get them from your machine with `list-exports`: `lab-DumpBucketName` and `lab-NotesFileSystemId`), then run:
+   ```bash
+   export AWS_DEFAULT_REGION=ap-southeast-1
+   BUCKET=<lab-dumps-... name>
+   FS=<fs-... id>
+
+   sudo dnf install -y amazon-efs-utils
+   sudo mkdir -p /mnt/notes
+   sudo mount -t efs -o tls,iam "$FS":/ /mnt/notes
+   sudo -E aws s3 sync "s3://$BUCKET/notes/" /mnt/notes/ --delete --dryrun   # preview
+   sudo -E aws s3 sync "s3://$BUCKET/notes/" /mnt/notes/ --delete
+   sudo chmod -R a+rX /mnt/notes
+   ```
+   `--delete` makes the file system an exact mirror of the S3 `notes/` prefix.
+4. Terminate the instance.
+
+### Verify (needs a running Kali, so after `20-class`)
+
+1. On a Kali: `ls ~/Desktop/notes` shows the notes.
+2. `sudo touch ~/Desktop/notes/test` fails (permission denied or read-only).
+3. `sudo mount -o remount,rw ~/Desktop/notes && sudo touch ~/Desktop/notes/test` still fails. This proves the restriction is enforced by EFS.
+
+If step 2 or 3 succeeds, the anonymous-client behaviour of the policy is not what we assumed. Fallback: have the Kali first-boot script sync the notes from S3 into a local folder instead of mounting EFS.

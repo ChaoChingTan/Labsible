@@ -1,0 +1,151 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  03-storage (permanent). EFS file system for the read-only lecture notes mounted on
+  every Kali at ~/Desktop/notes: a mount target in each class subnet (EFS allows one
+  per AZ), a security group allowing NFS from the Kali clients, and the security
+  group, role and instance profile for the short-lived admin instance that publishes
+  the notes. The read-only file system policy is applied by
+  scripts/apply-notes-policy.sh, because a policy inside this template cannot
+  reference the file system's own ARN. Requires 01-network and 02-platform.
+
+Parameters:
+  LabPrefix:
+    Type: String
+    Default: lab
+    Description: Prefix for resource names and export names. Must match 01-network.
+    AllowedPattern: "[a-z][a-z0-9-]{1,15}"
+
+  Class1:
+    Type: Number
+    Default: 31
+    Description: Class 1 subnet third octet. Must match 01-network.
+  Class2:
+    Type: Number
+    Default: 32
+    Description: Class 2 subnet third octet. Must match 01-network.
+  Class3:
+    Type: Number
+    Default: 33
+    Description: Class 3 subnet third octet. Must match 01-network.
+
+Resources:
+  # ---------------------------------------------------------- Security groups
+  # No inbound rules: the admin instance is managed through SSM Session Manager.
+  NotesAdminSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Notes admin instance - no inbound, manage it through SSM
+      VpcId: { "Fn::ImportValue": !Sub "${LabPrefix}-VpcId" }
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-notes-admin-sg" }
+        - { Key: Lab, Value: guac }
+
+  EfsSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EFS mount targets - NFS from Kali clients and the notes admin instance only
+      VpcId: { "Fn::ImportValue": !Sub "${LabPrefix}-VpcId" }
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: { "Fn::ImportValue": !Sub "${LabPrefix}-ClientSgId" }
+          Description: NFS from Kali clients
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref NotesAdminSg
+          Description: NFS from the notes admin instance
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-efs-sg" }
+        - { Key: Lab, Value: guac }
+
+  # -------------------------------------------------------------- File system
+  NotesFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic
+      BackupPolicy:
+        Status: ENABLED
+      FileSystemTags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-notes" }
+        - { Key: Lab, Value: guac }
+
+  # One mount target per AZ. This needs the three class subnets to be in three
+  # different AZs (the 01-network default). If two share an AZ, remove one target.
+  MountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref NotesFileSystem
+      SubnetId: { "Fn::ImportValue": !Sub "${LabPrefix}-ClassSubnet-PA${Class1}" }
+      SecurityGroups: [!Ref EfsSg]
+
+  MountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref NotesFileSystem
+      SubnetId: { "Fn::ImportValue": !Sub "${LabPrefix}-ClassSubnet-PA${Class2}" }
+      SecurityGroups: [!Ref EfsSg]
+
+  MountTarget3:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref NotesFileSystem
+      SubnetId: { "Fn::ImportValue": !Sub "${LabPrefix}-ClassSubnet-PA${Class3}" }
+      SecurityGroups: [!Ref EfsSg]
+
+  # --------------------------------------------------- Notes admin (publisher)
+  # The only identity allowed to write to the file system (see the policy script).
+  # Launch a short-lived Amazon Linux instance with this profile and security
+  # group, publish the notes, then terminate it.
+  NotesAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: notes-admin
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [elasticfilesystem:ClientMount, elasticfilesystem:ClientWrite]
+                Resource: !GetAtt NotesFileSystem.Arn
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Join ["", ["arn:", !Ref "AWS::Partition", ":s3:::", { "Fn::ImportValue": !Sub "${LabPrefix}-DumpBucketName" }]]
+                Condition:
+                  StringLike:
+                    "s3:prefix": ["notes", "notes/*"]
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Join ["", ["arn:", !Ref "AWS::Partition", ":s3:::", { "Fn::ImportValue": !Sub "${LabPrefix}-DumpBucketName" }, "/notes/*"]]
+      Tags:
+        - { Key: Lab, Value: guac }
+
+  NotesAdminInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref NotesAdminRole]
+
+Outputs:
+  NotesFileSystemId:
+    Value: !Ref NotesFileSystem
+    Export: { Name: !Sub "${LabPrefix}-NotesFileSystemId" }
+  NotesAdminRoleArn:
+    Value: !GetAtt NotesAdminRole.Arn
+    Export: { Name: !Sub "${LabPrefix}-NotesAdminRoleArn" }
+  NotesAdminInstanceProfileArn:
+    Value: !GetAtt NotesAdminInstanceProfile.Arn
+    Export: { Name: !Sub "${LabPrefix}-NotesAdminInstanceProfileArn" }
+  NotesAdminSgId:
+    Value: !Ref NotesAdminSg
+    Export: { Name: !Sub "${LabPrefix}-NotesAdminSgId" }
