@@ -13,6 +13,7 @@ Browser-based Kali Linux labs on AWS: Apache Guacamole behind an ALB connects to
 | `cfn/02-platform.yaml` | Deployed as stack `lab-platform` in ap-southeast-1. |
 | `cfn/03-storage.yaml` | Deployed as stack `lab-storage`; notes published; read-only policy applied by `scripts/apply-notes-policy.sh`. Read-only behaviour on a Kali client not yet verified (needs `20-class`). |
 | `ami/kali-firstboot.sh` | Written. Logic tested manually on a Kali instance. Not yet run through cloud-init. |
+| `cfn/10-database.yaml` | Written, passes `cfn-lint`. Not yet deployed. Ephemeral (per session). |
 
 ## Repo layout
 
@@ -21,6 +22,7 @@ cfn/
   01-network.yaml    VPC, subnets, routing, security groups
   02-platform.yaml   ALB, ACM cert, Route53 record, S3 dump bucket, secrets, IAM
   03-storage.yaml    EFS for read-only lecture notes, mount targets, notes admin role
+  10-database.yaml   RDS PostgreSQL for Guacamole (ephemeral, per session)
 ami/
   kali-firstboot.sh  user-data for Kali instances (password, compositor, hostname, notes mount)
 scripts/
@@ -314,3 +316,70 @@ aws cloudformation update-termination-protection \
 3. `sudo mount -o remount,rw ~/Desktop/notes && sudo touch ~/Desktop/notes/test` still fails. This proves the restriction is enforced by EFS.
 
 If step 2 or 3 succeeds, the anonymous-client behaviour of the policy is not what we assumed. Fallback: have the Kali first-boot script sync the notes from S3 into a local folder instead of mounting EFS.
+
+---
+
+## 10-database.yaml
+
+Ephemeral stack, created at spin-up and deleted at teardown. Stack numbering: `0x` are permanent, `1x` are shared per-session stacks, `2x` are per-class stacks. Requires `lab-network` and `lab-platform`.
+
+### Design decisions
+
+- **Single-AZ.** A database outage only blocks new logins and new connection starts. Live sessions keep running, because the database is not in the data path.
+- **Credentials come from the permanent `DbSecret`** (created by `02-platform`), so a recreated database and the web nodes always agree on the password.
+- **The SQL dump in S3 is the primary restore path.** Deleting the stack also leaves a final RDS snapshot as a safety net.
+- **Exports are consumed by the web stack,** so the web stack must be deleted before this one (CloudFormation refuses to delete an export that is in use).
+- **Dump and restore scripts arrive with the web stack,** because they run on a web node (the only machine with network access to the database).
+
+### Resources
+
+| Resource | Detail |
+|---|---|
+| DB subnet group | The two ALB subnets (two AZs, as RDS requires) |
+| RDS PostgreSQL instance | `db.t4g.micro`, 20 GB gp3, encrypted, not publicly accessible, 1-day automated backups |
+| Security group | `lab-db-sg` from `01-network`: 5432 from the web nodes only |
+| Deletion behaviour | `DeletionPolicy: Snapshot` (final snapshot kept) |
+
+### Parameters
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `LabPrefix` | `lab` | Must match the other stacks |
+| `DbInstanceClass` | `db.t4g.micro` | |
+| `EngineVersion` | `16` | Major only lets RDS pick the current minor. Use a full version to pin. |
+| `AllocatedStorage` | `20` | GB |
+| `MultiAz` | `false` | |
+| `DbName` | `guacamole_db` | |
+
+### Exports
+
+`lab-DbEndpoint`, `lab-DbPort`, `lab-DbName`
+
+### Deploy
+
+```bash
+source params/lab.env
+
+aws cloudformation deploy \
+  --region "$AWS_REGION" \
+  --stack-name lab-database \
+  --template-file cfn/10-database.yaml
+```
+
+Creation takes several minutes.
+
+### Verify after deploy
+
+1. `aws rds describe-db-instances --region "$AWS_REGION" --query "DBInstances[?contains(DBInstanceIdentifier,'lab-database')].[DBInstanceStatus,Endpoint.Address]" --output text` shows `available` and an endpoint.
+2. The three exports above exist (`aws cloudformation list-exports`).
+
+### Teardown
+
+Delete this stack after the web stack. A final snapshot is created; list and clean up old ones:
+
+```bash
+aws rds describe-db-snapshots --region "$AWS_REGION" --snapshot-type manual \
+  --query "DBSnapshots[].[DBSnapshotIdentifier,SnapshotCreateTime]" --output table
+```
+
+Snapshots cost storage until deleted.
