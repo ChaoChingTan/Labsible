@@ -1,0 +1,326 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  01-network (permanent). Guacamole lab VPC: public-only design, no NAT.
+  Public ALB subnets (2 AZs), web subnets (2 AZs), one subnet per class (AZ per
+  class is a parameter), shared public route table via IGW, S3 gateway endpoint,
+  and security groups for ALB, web, guacd NLB, guacd, Kali clients and database.
+  Kali clients accept RDP only from the guacd security group.
+
+Parameters:
+  LabPrefix:
+    Type: String
+    Default: lab
+    Description: Prefix for resource names and cross-stack export names.
+    AllowedPattern: "[a-z][a-z0-9-]{1,15}"
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: Must be a /16. Subnets are carved out as /24s by third octet.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/16$'
+
+  Class1:
+    Type: Number
+    Default: 31
+    MinValue: 10
+    MaxValue: 255
+    Description: Third octet for class 1 subnet (31 -> PA31 -> 10.0.31.0/24).
+  Class2:
+    Type: Number
+    Default: 32
+    MinValue: 10
+    MaxValue: 255
+    Description: Third octet for class 2 subnet.
+  Class3:
+    Type: Number
+    Default: 33
+    MinValue: 10
+    MaxValue: 255
+    Description: Third octet for class 3 subnet.
+
+  Class1Az:
+    Type: Number
+    Default: 0
+    AllowedValues: [0, 1, 2]
+    Description: AZ index for class 1 (0 = first AZ in the region). Needs 3 AZs for index 2.
+  Class2Az:
+    Type: Number
+    Default: 1
+    AllowedValues: [0, 1, 2]
+    Description: AZ index for class 2. Spread classes so an AZ outage affects only one class.
+  Class3Az:
+    Type: Number
+    Default: 2
+    AllowedValues: [0, 1, 2]
+    Description: AZ index for class 3.
+
+Resources:
+  # ---------------------------------------------------------------- VPC / IGW
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-vpc" }
+        - { Key: Lab, Value: guac }
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-igw" }
+        - { Key: Lab, Value: guac }
+
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Igw
+
+  # ------------------------------------------------------------------ Subnets
+  # /24 index N inside the /16 => 10.0.N.0/24.
+  AlbSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 256, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-alb-a" }
+        - { Key: Lab, Value: guac }
+
+  AlbSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 256, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-alb-b" }
+        - { Key: Lab, Value: guac }
+
+  # Web tier subnets: one per AZ so the web Auto Scaling group can span AZs.
+  GuacSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [10, !Cidr [!Ref VpcCidr, 256, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-guac-a" }
+        - { Key: Lab, Value: guac }
+
+  GuacSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [11, !Cidr [!Ref VpcCidr, 256, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-guac-b" }
+        - { Key: Lab, Value: guac }
+
+  # Class subnets: guacd NLB, guacd nodes and Kali for a class all live here,
+  # so guacd -> Kali RDP traffic never crosses an AZ.
+  ClassSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [!Ref Class1Az, !GetAZs ""]
+      CidrBlock: !Select [!Ref Class1, !Cidr [!Ref VpcCidr, 256, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-class-PA${Class1}" }
+        - { Key: Class, Value: !Sub "PA${Class1}" }
+        - { Key: Lab, Value: guac }
+
+  ClassSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [!Ref Class2Az, !GetAZs ""]
+      CidrBlock: !Select [!Ref Class2, !Cidr [!Ref VpcCidr, 256, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-class-PA${Class2}" }
+        - { Key: Class, Value: !Sub "PA${Class2}" }
+        - { Key: Lab, Value: guac }
+
+  ClassSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [!Ref Class3Az, !GetAZs ""]
+      CidrBlock: !Select [!Ref Class3, !Cidr [!Ref VpcCidr, 256, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-class-PA${Class3}" }
+        - { Key: Class, Value: !Sub "PA${Class3}" }
+        - { Key: Lab, Value: guac }
+
+  # ------------------------------------------------------------------ Routing
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-public-rt" }
+        - { Key: Lab, Value: guac }
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  AlbSubnetARoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AlbSubnetA, RouteTableId: !Ref PublicRouteTable }
+  AlbSubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AlbSubnetB, RouteTableId: !Ref PublicRouteTable }
+  GuacSubnetARoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref GuacSubnetA, RouteTableId: !Ref PublicRouteTable }
+  GuacSubnetBRoute:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref GuacSubnetB, RouteTableId: !Ref PublicRouteTable }
+  ClassSubnet1Route:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref ClassSubnet1, RouteTableId: !Ref PublicRouteTable }
+  ClassSubnet2Route:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref ClassSubnet2, RouteTableId: !Ref PublicRouteTable }
+  ClassSubnet3Route:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref ClassSubnet3, RouteTableId: !Ref PublicRouteTable }
+
+  # Free: keeps DB-dump traffic to S3 off the public internet path.
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      VpcEndpointType: Gateway
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      RouteTableIds: [!Ref PublicRouteTable]
+
+  # --------------------------------------------------------- Security groups
+  # Traffic path: internet -> ALB -> web -> (NLB) -> guacd -> Kali, and web -> DB.
+  # Never allow guacd (4822) from a class subnet CIDR: guacd has no authentication
+  # and students on Kali could use it as a pivot. Reference security groups only.
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - HTTPS from the internet
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: HTTPS }
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: HTTP (redirect to HTTPS) }
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-alb-sg" }
+        - { Key: Lab, Value: guac }
+
+  GuacSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Guacamole web nodes - web port from ALB only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourceSecurityGroupId: !Ref AlbSg, Description: Guacamole web from ALB }
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-guac-sg" }
+        - { Key: Lab, Value: guac }
+
+  GuacdNlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal NLBs in front of guacd - 4822 from web nodes only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 4822, ToPort: 4822, SourceSecurityGroupId: !Ref GuacSg, Description: guacd protocol from web nodes }
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-guacd-nlb-sg" }
+        - { Key: Lab, Value: guac }
+
+  GuacdSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: guacd nodes - 4822 from web nodes and the NLB SG only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 4822, ToPort: 4822, SourceSecurityGroupId: !Ref GuacSg, Description: guacd from web nodes }
+        - { IpProtocol: tcp, FromPort: 4822, ToPort: 4822, SourceSecurityGroupId: !Ref GuacdNlbSg, Description: guacd from NLB (health checks) }
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-guacd-sg" }
+        - { Key: Lab, Value: guac }
+
+  ClientSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Kali clients - RDP from guacd SG only. No SSH, no CIDR rules.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3389, ToPort: 3389, SourceSecurityGroupId: !Ref GuacdSg, Description: RDP from guacd }
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-client-sg" }
+        - { Key: Lab, Value: guac }
+
+  DbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Guacamole database (PostgreSQL) - 5432 from web nodes only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref GuacSg, Description: PostgreSQL from web nodes }
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-db-sg" }
+        - { Key: Lab, Value: guac }
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub "${LabPrefix}-VpcId" }
+  VpcCidr:
+    Value: !GetAtt Vpc.CidrBlock
+    Export: { Name: !Sub "${LabPrefix}-VpcCidr" }
+  AlbSubnetIds:
+    Value: !Join [",", [!Ref AlbSubnetA, !Ref AlbSubnetB]]
+    Export: { Name: !Sub "${LabPrefix}-AlbSubnetIds" }
+  GuacSubnetIds:
+    Value: !Join [",", [!Ref GuacSubnetA, !Ref GuacSubnetB]]
+    Export: { Name: !Sub "${LabPrefix}-GuacSubnetIds" }
+  ClassSubnetPA1:
+    Value: !Ref ClassSubnet1
+    Export: { Name: !Sub "${LabPrefix}-ClassSubnet-PA${Class1}" }
+  ClassSubnetPA2:
+    Value: !Ref ClassSubnet2
+    Export: { Name: !Sub "${LabPrefix}-ClassSubnet-PA${Class2}" }
+  ClassSubnetPA3:
+    Value: !Ref ClassSubnet3
+    Export: { Name: !Sub "${LabPrefix}-ClassSubnet-PA${Class3}" }
+  AlbSgId:
+    Value: !Ref AlbSg
+    Export: { Name: !Sub "${LabPrefix}-AlbSgId" }
+  GuacSgId:
+    Value: !Ref GuacSg
+    Export: { Name: !Sub "${LabPrefix}-GuacSgId" }
+  GuacdNlbSgId:
+    Value: !Ref GuacdNlbSg
+    Export: { Name: !Sub "${LabPrefix}-GuacdNlbSgId" }
+  GuacdSgId:
+    Value: !Ref GuacdSg
+    Export: { Name: !Sub "${LabPrefix}-GuacdSgId" }
+  ClientSgId:
+    Value: !Ref ClientSg
+    Export: { Name: !Sub "${LabPrefix}-ClientSgId" }
+  DbSgId:
+    Value: !Ref DbSg
+    Export: { Name: !Sub "${LabPrefix}-DbSgId" }
