@@ -200,7 +200,7 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: !Ref DbSecret
+                Resource: [!Ref DbSecret, !Ref GuacAdminSecret]
               - Effect: Allow
                 Action: [s3:ListBucket, s3:GetBucketLocation]
                 Resource: !GetAtt DumpBucket.Arn
