@@ -14,7 +14,7 @@ Browser-based Kali Linux labs on AWS: Apache Guacamole behind an ALB connects to
 | `cfn/03-storage.yaml` | Deployed as stack `lab-storage`; notes published; read-only policy applied by `scripts/apply-notes-policy.sh`. Read-only behaviour on a Kali client not yet verified (needs `20-class`). |
 | `ami/kali-firstboot.sh` | Written. Logic tested manually on a Kali instance. Not yet run through cloud-init. |
 | `cfn/10-database.yaml` | Deployed as stack `lab-database`. Ephemeral (per session). |
-| `cfn/11-web.yaml` | Deployed as stack `lab-web`; both targets healthy; Guacamole shows an error page until the database schema is loaded. Ephemeral (per session). |
+| `cfn/11-web.yaml` | Deployed as stack `lab-web`; both targets healthy; admin login works after `scripts/db-run.sh init`. Ephemeral (per session). |
 
 ## Repo layout
 
@@ -30,6 +30,7 @@ ami/
 scripts/
   db-run.sh               runs db tasks (init / restore / dump) on a web node via SSM
   node/db-node.sh         the task itself; runs on the web node
+  sync_guac.py            roster -> Guacamole users, connections, permissions (REST API)
   apply-notes-policy.sh   applies the read-only EFS policy after 03-storage is deployed
 params/
   lab.env.example    template for local, git-ignored deployment settings
@@ -468,4 +469,34 @@ scripts/db-run.sh dump                    # write s3://<dump bucket>/dumps/guaca
 - The `guacadmin` password is set from the permanent `GuacAdminSecret` after every init or restore. Read it with `aws secretsmanager get-secret-value --secret-id <GuacAdminSecretArn> --query SecretString --output text`.
 - Dumps use `pg_dump --no-owner --no-acl` (this database only).
 - The web role needs read access to `GuacAdminSecret`; redeploy `lab-platform` after pulling this change (`--capabilities CAPABILITY_IAM`).
-- Status: written, not yet tested. Schema creation relies on the container's `initdb.sh --postgresql`.
+- Status: `init`, `dump` and `restore` tested (users survive a delete and redeploy of `lab-web` and `lab-database`). Make every change you want to keep, then run `dump` as the last step before teardown.
+
+---
+
+## Roster sync (`scripts/sync_guac.py`)
+
+Reads a roster CSV (`class,email,name`; format example in `params/roster.example.csv`) and creates, through Guacamole's REST API, the users, RDP connections, READ permissions and class groups. Run from your machine after the database is restored. Needs the AWS CLI configured and `LAB_DOMAIN` / `AWS_REGION` from `params/lab.env`.
+
+```bash
+source params/lab.env
+scripts/sync_guac.py roster/roster.csv --dry-run          # show the plan, change nothing
+scripts/sync_guac.py roster/roster.csv
+scripts/sync_guac.py --reset someone@example.com          # new password for one existing user
+scripts/sync_guac.py --show someone@example.com           # what can this user see? (read-only)
+```
+
+- **Users:** the email is the Guacamole username, with a random 14-character password. The roster name is stored as the user's full name (shown in the user menu after login) and the email as the email address. These are set when the user is created only.
+- **Index and IP:** each new student gets the next free index in the class (existing connections are read back from Guacamole). The Kali IP is `10.0.<class>.(100+index)`. A connection is named `<CLASS>-S<NN> <email>`, and that name is how an existing student is recognised on later runs.
+- **Routing:** each connection points at the student's Kali (RDP, shared `kali` desktop login, low-bandwidth settings) and carries the per-connection guacd override `10.0.<class>.10:4822`, which sends the session to that class's guacd pool.
+- **Visibility:** a student has READ on their own connection only and no system permissions. Checked with `--show`: direct and effective (including group) permissions list only that one connection.
+- **Class groups:** `PA31` / `PA32` / `PA33`, for admin convenience. Groups carry no permissions. If the group calls fail, the script warns and continues without them.
+- **Never touched:** existing users keep their password and details. Nothing is ever deleted by the script. A new user always receives READ on their connection, including when the connection already existed (for example after a user was deleted and re-created).
+- **Moving classes:** a student whose email already has a connection in another class stops the run; resolve it by hand.
+- **Output** goes to `roster/out/` (git-ignored, mode 600): `credentials-<timestamp>.csv` (new users only; the only copy of the plaintext passwords) and `assignments-<timestamp>.csv` (class, index, IP, email, name for every roster row). Timestamps include the time so a second run never overwrites an earlier credentials file.
+- **After a sync,** run `scripts/db-run.sh dump` so the new users are in the next restore.
+- **Test data:** before real students are loaded, deleting all test users and connections in the admin UI resets the numbering to 1. Once real students exist, do not delete connections: the index (and with it the Kali IP) is derived from them and must stay stable for the semester.
+
+### Notes from testing
+
+- The web tier has two nodes and a Guacamole login token only exists on the node that issued it, so API calls must stay on one node. The script keeps the ALB stickiness cookie for this. Any other client calling the API (for example curl) needs a cookie jar (`-c` / `-b`), otherwise calls fail randomly with `403 Permission Denied`.
+- Status: tested against a live Guacamole: users, names, connections, per-user visibility and re-running without changes. The connection itself has not been opened yet (needs the class stack with guacd and Kali).
