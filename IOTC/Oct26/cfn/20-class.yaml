@@ -55,13 +55,15 @@ Parameters:
 
   GuacdMinSize:
     Type: Number
-    Default: 2
+    Default: 3
     MinValue: 1
-    Description: Number of guacd nodes. 2 means one node can fail without ending sessions for new logins.
+    Description: >
+      Number of guacd nodes. 3 gives headroom for a full class and lets one node fail without
+      ending sessions for new logins. Lower it for small tests. Each node is about $0.10/hr.
 
   GuacdMaxSize:
     Type: Number
-    Default: 2
+    Default: 3
     MinValue: 1
 
   GuacdImage:
