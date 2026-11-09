@@ -5,6 +5,8 @@
 #   source params/lab.env && scripts/db-run.sh init
 #   source params/lab.env && scripts/db-run.sh restore [dump-file-name]
 #   source params/lab.env && scripts/db-run.sh dump
+#   init-if-empty / restore-if-empty behave like init / restore but do nothing when the database
+#   already has tables (used by spin-up.sh).
 set -euo pipefail
 
 PREFIX="${LAB_PREFIX:-lab}"

@@ -5,6 +5,8 @@
 #   db-node.sh init              empty database -> Guacamole schema + guacadmin password
 #   db-node.sh restore [KEY]     empty database -> restore dump (default: newest) + guacadmin password
 #   db-node.sh dump              write a dump to s3://$DUMP_BUCKET/dumps/
+#   db-node.sh init-if-empty     like init, but does nothing (exit 0) if the database already has tables
+#   db-node.sh restore-if-empty [KEY]   same for restore
 #
 # Environment: DUMP_BUCKET, GUAC_ADMIN_SECRET_ARN, AWS_REGION (set by db-run.sh).
 # Database settings are read from /etc/guacamole.env (written at boot, mode 600).
@@ -48,9 +50,14 @@ SQL
 }
 
 case "$MODE" in
-  init|restore)
+  init|restore|init-if-empty|restore-if-empty)
     n=$(table_count)
-    [ "$n" = "0" ] || { echo "database is not empty ($n tables); refusing to $MODE" >&2; exit 1; }
+    if [[ "$MODE" == *-if-empty ]]; then
+      if [ "$n" != "0" ]; then echo "database already initialised ($n tables); nothing to do"; exit 0; fi
+      MODE="${MODE%-if-empty}"
+    else
+      [ "$n" = "0" ] || { echo "database is not empty ($n tables); refusing to $MODE" >&2; exit 1; }
+    fi
     if [ "$MODE" = init ]; then
       docker run --rm "$GUAC_IMAGE" /opt/guacamole/bin/initdb.sh --postgresql | psql_
       echo "schema loaded"
