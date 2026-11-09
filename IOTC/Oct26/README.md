@@ -11,8 +11,8 @@ Browser-based Kali Linux labs on AWS: Apache Guacamole behind an ALB connects to
 |---|---|
 | `cfn/01-network.yaml` | Deployed as stack `lab-network` in ap-southeast-1. |
 | `cfn/02-platform.yaml` | Deployed as stack `lab-platform` in ap-southeast-1. |
-| `cfn/03-storage.yaml` | Deployed as stack `lab-storage`; notes published; read-only policy applied by `scripts/apply-notes-policy.sh`. Read-only behaviour on a Kali client not yet verified. |
-| `ami/kali-firstboot.sh` | Written. Logic tested manually on a Kali instance. Runs from the class stack's user data; its results (hostname, notes mount) not yet checked on a deployed Kali. |
+| `cfn/03-storage.yaml` | Deployed as stack `lab-storage`; notes published; read-only policy applied by `scripts/apply-notes-policy.sh`. On a Kali, the notes are read-only: refused by the `ro` mount and, tested separately, by the EFS policy itself. |
+| `ami/kali-firstboot.sh` | Written. Logic tested manually on a Kali instance. Runs from the class stack's user data; hostname and notes mount verified on a deployed Kali. |
 | `cfn/10-database.yaml` | Deployed as stack `lab-database`. Ephemeral (per session). |
 | `cfn/11-web.yaml` | Deployed as stack `lab-web`; both targets healthy; admin login works after `scripts/db-run.sh init`. Ephemeral (per session). |
 | `cfn/20-class.yaml` | Deployed as stack `lab-class-pa31`; an RDP session from Guacamole to a Kali opens with no password prompt. Ephemeral (one stack per class). |
@@ -562,9 +562,12 @@ aws cloudformation delete-stack --region "$AWS_REGION" --stack-name lab-class-pa
 ### Verified
 
 - A student connection opened from Guacamole reaches the Kali through the NLB and a guacd node, and logs in with no password prompt at the RDP screen (the connection carries the shared `kali` login).
+- xrdp session reattach: after a disconnect, reopening the connection returns to the same desktop with the student's work still open.
+- Hostname: a deployed Kali shows `kali@pa31-101` (set from the instance Name tag by the first-boot script).
+- Notes mount: on a deployed Kali, `touch ~/Desktop/notes/<file>` fails with "Read-only file system". This is the client-side `ro` mount.
+- EFS policy enforcement: with the notes remounted read-write on a Kali (`findmnt` showed `rw`), a write was still refused with "Read-only file system". The file system policy enforces read-only on its own, so a student with `sudo` cannot change the notes by remounting.
+- guacd failover: with both guacd nodes terminated, the Auto Scaling group started replacements and the connection was restored after a short interruption. The recovery time was not measured.
 
 ### Not yet verified
 
-- xrdp session reattach after a disconnect.
-- The read-only notes mount on a Kali (writes must be refused), and the hostname set from the instance Name tag.
 - Load: guacd CPU with a full class of simultaneous sessions.
