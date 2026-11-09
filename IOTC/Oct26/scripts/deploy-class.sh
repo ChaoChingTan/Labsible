@@ -6,6 +6,7 @@
 #   source params/lab.env
 #   scripts/deploy-class.sh PA31                  # every student with a connection
 #   scripts/deploy-class.sh PA31 --indexes 1,2,3  # only these (for tests)
+#   scripts/deploy-class.sh PA31 --guacd-count 2  # fewer guacd nodes for a small test
 #   scripts/deploy-class.sh PA31 --yes            # skip the confirmation prompt
 #   scripts/deploy-class.sh PA31 --extra-script labs/web-sec.sh
 #                                                 # optional lab-specific commands, run after kali-firstboot.sh
@@ -15,7 +16,7 @@
 #   LAB_KALI_AMI_ID              required: the golden Kali AMI for this lab
 #   KALI_INSTANCE_TYPE           default t3.small
 #   GUACD_INSTANCE_TYPE          default c6i.large
-#   GUACD_COUNT                  default 2
+#   GUACD_COUNT                  default 3 (or --guacd-count N)
 set -euo pipefail
 
 CLASS="${1:?usage: deploy-class.sh PA31|PA32|PA33 [--indexes 1,2,3] [--yes]}"; shift
@@ -26,6 +27,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --indexes) INDEXES="${2:?}"; shift 2 ;;
     --yes) YES=1; shift ;;
+    --guacd-count) GUACD_COUNT="${2:?}"; shift 2 ;;
     --extra-script) EXTRA="${2:?}"; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
@@ -35,7 +37,8 @@ REGION="${AWS_REGION:?source params/lab.env first}"
 AMI="${LAB_KALI_AMI_ID:?set LAB_KALI_AMI_ID in params/lab.env}"
 KALI_TYPE="${KALI_INSTANCE_TYPE:-t3.small}"
 GUACD_TYPE="${GUACD_INSTANCE_TYPE:-c6i.large}"
-GUACD_COUNT="${GUACD_COUNT:-2}"
+GUACD_COUNT="${GUACD_COUNT:-3}"
+[[ "$GUACD_COUNT" =~ ^[1-9][0-9]*$ ]] || { echo "guacd count must be a positive number" >&2; exit 1; }
 PREFIX="${LAB_PREFIX:-lab}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(dirname "$HERE")"
