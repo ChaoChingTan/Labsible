@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::LanguageExtensions
+Description: >
+  20-class (ephemeral, one stack per class, for example lab-class-pa31). The guacd pool
+  behind an internal NLB with a fixed address (10.0.<class>.10:4822) and one Kali desktop
+  per student, each at 10.0.<class>.(100+index). sync_guac.py writes exactly these
+  addresses into the Guacamole connections. Deploy with scripts/deploy-class.sh.
+  The Kali instances are created by a loop (AWS::LanguageExtensions); deploy-class.sh also
+  passes CAPABILITY_AUTO_EXPAND, which is harmless if the loop alone does not need it.
+  Requires 01-network, 02-platform and 03-storage.
+
+Parameters:
+  LabPrefix:
+    Type: String
+    Default: lab
+    Description: Prefix for resource names and export names. Must match the other stacks.
+    AllowedPattern: "[a-z][a-z0-9-]{1,15}"
+
+  ClassOctet:
+    Type: String
+    AllowedValues: ["31", "32", "33"]
+    Description: >
+      The class this stack serves, as its subnet's third octet: 31 = PA31, 32 = PA32,
+      33 = PA33. Picks the subnet, the NLB address and the Kali addresses.
+
+  KaliHostOctets:
+    Type: CommaDelimitedList
+    Description: >
+      Last octet of each Kali address, one Kali per value, for example 101,102,103.
+      The octet is 100 + the student index (so 101 to 254). scripts/deploy-class.sh
+      converts the indexes for you. CloudFormation cannot do the arithmetic itself.
+    AllowedPattern: "^(10[1-9]|1[1-9][0-9]|2[0-4][0-9]|25[0-4])$"
+
+  KaliAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: Golden Kali AMI for this lab (kept in params/lab.env, not in git).
+
+  KaliInstanceType:
+    Type: String
+    Default: t3.small
+    AllowedPattern: '^[a-z0-9]+\.[a-z0-9]+$'
+
+  KaliBootPayload:
+    Type: String
+    MaxLength: 4096
+    Description: >
+      kali-firstboot.sh compressed with gzip and base64-encoded (scripts/deploy-class.sh
+      builds it). The instance decodes and runs it at first boot.
+
+  GuacdInstanceType:
+    Type: String
+    Default: c6i.large
+    AllowedPattern: '^[a-z0-9]+\.[a-z0-9]+$'
+    Description: Compute-optimised, x86. guacd is CPU-bound. Avoid burstable t3 here.
+
+  GuacdMinSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Number of guacd nodes. 2 means one node can fail without ending sessions for new logins.
+
+  GuacdMaxSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+
+  GuacdImage:
+    Type: String
+    Default: guacamole/guacd:1.6.0
+    AllowedPattern: '^[a-z0-9./_-]+:[A-Za-z0-9._-]+$'
+    Description: Pinned image tag. Keep the version in step with the web image.
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Amazon Linux 2023 (x86_64) for the guacd nodes, resolved at deploy time.
+
+Resources:
+  # ------------------------------------------------------------- guacd pool + NLB
+  GuacdNlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${LabPrefix}-pa${ClassOctet}-guacd"
+      Type: network
+      Scheme: internal
+      SecurityGroups: [{ "Fn::ImportValue": !Sub "${LabPrefix}-GuacdNlbSgId" }]
+      SubnetMappings:
+        - SubnetId: { "Fn::ImportValue": !Sub "${LabPrefix}-ClassSubnet-PA${ClassOctet}" }
+          PrivateIPv4Address: !Sub "10.0.${ClassOctet}.10"
+      Tags:
+        - { Key: Lab, Value: guac }
+        - { Key: Class, Value: !Sub "PA${ClassOctet}" }
+
+  GuacdTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: { "Fn::ImportValue": !Sub "${LabPrefix}-VpcId" }
+      Protocol: TCP
+      Port: 4822
+      TargetType: instance
+      HealthCheckProtocol: TCP
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+      Tags:
+        - { Key: Lab, Value: guac }
+        - { Key: Class, Value: !Sub "PA${ClassOctet}" }
+
+  GuacdListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref GuacdNlb
+      Protocol: TCP
+      Port: 4822
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GuacdTargetGroup
+
+  # Bash variables are written without braces: this block goes through Fn::Sub.
+  GuacdLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${LabPrefix}-pa${ClassOctet}-guacd"
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref GuacdInstanceType
+        IamInstanceProfile:
+          Arn: { "Fn::ImportValue": !Sub "${LabPrefix}-GuacdInstanceProfileArn" }
+        # No NAT in this design, so the node needs a public IP to pull the image.
+        # Inbound is still limited to the web nodes and the NLB by the security group.
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups: [{ "Fn::ImportValue": !Sub "${LabPrefix}-GuacdSgId" }]
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: { VolumeSize: 16, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${LabPrefix}-pa${ClassOctet}-guacd" }
+              - { Key: Lab, Value: guac }
+              - { Key: Class, Value: !Sub "PA${ClassOctet}" }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+            exec > >(tee -a /var/log/lab-guacd-boot.log /dev/console) 2>&1
+            echo "lab-guacd: start $(date -u +%FT%TZ)"
+            dnf install -y docker
+            systemctl enable --now docker
+            docker run -d --name guacd --restart unless-stopped \
+              --log-opt max-size=10m --log-opt max-file=3 \
+              -p 4822:4822 ${GuacdImage}
+            echo "lab-guacd: done $(date -u +%FT%TZ)"
+
+  GuacdAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: GuacdListener
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: false
+    Properties:
+      AutoScalingGroupName: !Sub "${LabPrefix}-pa${ClassOctet}-guacd"
+      MinSize: !Ref GuacdMinSize
+      MaxSize: !Ref GuacdMaxSize
+      DesiredCapacity: !Ref GuacdMinSize
+      VPCZoneIdentifier: [{ "Fn::ImportValue": !Sub "${LabPrefix}-ClassSubnet-PA${ClassOctet}" }]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref GuacdLaunchTemplate
+        Version: !GetAtt GuacdLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: [!Ref GuacdTargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - { Key: Name, Value: !Sub "${LabPrefix}-pa${ClassOctet}-guacd", PropagateAtLaunch: false }
+        - { Key: Lab, Value: guac, PropagateAtLaunch: true }
+
+  # ------------------------------------------------------------------ Kali clients
+  # One instance per student index, at 10.0.<class>.(100+index). No instance profile:
+  # nothing on the desktop needs AWS access (the notes mount is plain NFS).
+  # One instance per host octet, at 10.0.<class>.<octet>. No instance profile: nothing on
+  # the desktop needs AWS access (the notes mount is plain NFS). Inside the body the loop
+  # value is read with !Ref Octet (the documented form); a quoted "${Octet}" string is only
+  # replaced in the logical ID and in Fn::Sub strings, not inside Fn::Join.
+  Fn::ForEach::Kali:
+    - Octet
+    - !Ref KaliHostOctets
+    - "Kali${Octet}":
+        Type: AWS::EC2::Instance
+        Properties:
+          ImageId: !Ref KaliAmiId
+          InstanceType: !Ref KaliInstanceType
+          NetworkInterfaces:
+            - DeviceIndex: "0"
+              SubnetId: { "Fn::ImportValue": !Sub "${LabPrefix}-ClassSubnet-PA${ClassOctet}" }
+              GroupSet: [{ "Fn::ImportValue": !Sub "${LabPrefix}-ClientSgId" }]
+              AssociatePublicIpAddress: true
+              PrivateIpAddress: !Join ["", ["10.0.", !Ref ClassOctet, ".", !Ref Octet]]
+          MetadataOptions:
+            HttpTokens: required
+            HttpPutResponseHopLimit: 1
+            InstanceMetadataTags: enabled
+          UserData:
+            Fn::Base64: !Sub
+              - |
+                #!/bin/bash
+                export EFS_ID=${EfsId} REGION=${AWS::Region}
+                echo '${Payload}' | base64 -d | gunzip | bash
+              - EfsId: { "Fn::ImportValue": !Sub "${LabPrefix}-NotesFileSystemId" }
+                Payload: !Ref KaliBootPayload
+          Tags:
+            - Key: Name
+              Value: !Join ["", ["pa", !Ref ClassOctet, "-", !Ref Octet]]
+            - { Key: Lab, Value: guac }
+            - { Key: Class, Value: !Sub "PA${ClassOctet}" }
+
+Outputs:
+  GuacdAddress:
+    Description: Address the Guacamole connections use as the guacd override.
+    Value: !Sub "10.0.${ClassOctet}.10:4822"
+  GuacdAsgName:
+    Value: !Ref GuacdAsg
