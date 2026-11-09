@@ -57,14 +57,28 @@ if [ -n "$TOKEN" ]; then
   fi
 fi
 
+# 3b. DNS. Point systemd-resolved at the Amazon-provided resolver (169.254.169.253, valid on every
+#     instance). Some images do not hand the DHCP DNS server to systemd-resolved, so every lookup is
+#     REFUSED, and the EFS name below cannot resolve. Only that resolver resolves EFS names.
+if systemctl is-active --quiet systemd-resolved; then
+  mkdir -p /etc/systemd/resolved.conf.d
+  printf '[Resolve]\nDNS=169.254.169.253\n' > /etc/systemd/resolved.conf.d/aws-dns.conf
+  systemctl restart systemd-resolved
+  echo "dns: $(resolvectl dns 2>/dev/null | tr '\n' ' ')"
+else
+  echo "dns: systemd-resolved not active, left unchanged"
+fi
+
 # 4. Read-only lecture notes from EFS. The write protection is enforced by the
 #    EFS file system policy; "ro" here is only a convenience.
 if [ -n "${EFS_ID:-}" ] && [ -n "${REGION:-}" ]; then
   MNT="/home/${KALI_USER}/Desktop/notes"
   mkdir -p "$MNT"
-  if ! grep -q " ${MNT} " /etc/fstab; then
-    echo "${EFS_ID}.efs.${REGION}.amazonaws.com:/ ${MNT} nfs4 nfsvers=4.1,ro,hard,timeo=600,retrans=2,noresvport,nofail,_netdev 0 0" >> /etc/fstab
-  fi
+  # Replace any line for this mount point (an AMI built from a Kali that had the notes mounted
+  # carries one, possibly with an old file system ID).
+  sed -i "\#[[:space:]]${MNT}[[:space:]]#d" /etc/fstab
+  echo "${EFS_ID}.efs.${REGION}.amazonaws.com:/ ${MNT} nfs4 nfsvers=4.1,ro,hard,timeo=600,retrans=2,noresvport,nofail,_netdev 0 0" >> /etc/fstab
+  systemctl daemon-reload 2>/dev/null || true
   for i in $(seq 1 10); do
     if mount "$MNT"; then echo "notes mounted at $MNT"; break; fi
     echo "notes mount attempt $i failed, retrying"; sleep 6
