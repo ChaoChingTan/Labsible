@@ -32,6 +32,7 @@ ami/
 scripts/
   db-run.sh               runs db tasks (init / restore / dump) on a web node via SSM
   node/db-node.sh         the task itself; runs on the web node
+  teardown.sh             ends a session safely: dump, then delete class, web and database stacks
   deploy-class.sh         deploys/updates one class stack from Guacamole's connection list
   sync_guac.py            roster -> Guacamole users, connections, permissions (REST API)
   apply-notes-policy.sh   applies the read-only EFS policy after 03-storage is deployed
@@ -572,3 +573,25 @@ aws cloudformation delete-stack --region "$AWS_REGION" --stack-name lab-class-pa
 ### Not yet verified
 
 - Load: guacd CPU with a full class of simultaneous sessions.
+
+---
+
+## Teardown (`scripts/teardown.sh`)
+
+Ends a session in the right order and refuses to delete anything it cannot first save. The permanent stacks (network, platform, storage) are never touched.
+
+```bash
+source params/lab.env
+scripts/teardown.sh --all --dry-run          # show the plan, change nothing
+scripts/teardown.sh --class PA31             # only PA31's class stack; web and database stay up
+scripts/teardown.sh --class PA31 --class PA32
+scripts/teardown.sh --all                    # dump, then delete all class stacks, web, database
+```
+
+- **`--all`:** runs `db-run.sh dump` first, then checks that a new, non-trivial (at least 1000 bytes) dump file exists in S3. If the dump fails or the check fails, nothing is deleted. Then it deletes the class stacks (in parallel), then `lab-web`, then `lab-database`, waiting for each step.
+- **`--class PAxx`:** deletes only that class's stack, with no dump (the database is not touched). Run `db-run.sh dump` yourself if you changed users since the last dump.
+- **No web stack but a database stack:** `--all` stops, because the dump runs on a web node. `--skip-dump` deletes the database anyway; anything since the last dump is lost.
+- **Prompts:** it prints the plan and asks to continue; `--yes` skips the prompt.
+- **Afterwards:** it lists the RDS final snapshots left behind. It never deletes them; remove old ones with `aws rds delete-db-snapshot`.
+- Status: tested with a stubbed AWS command (order of deletion, dump failure, no new dump file, tiny dump, class-only, nothing to delete, database without web, bad usage), and run with `--all` against the real account: dump, deletion in order and the snapshot listing all worked.
+- Each teardown leaves one RDS final snapshot, so they accumulate. Keep the newest as a safety net behind the S3 dump and delete older ones.
