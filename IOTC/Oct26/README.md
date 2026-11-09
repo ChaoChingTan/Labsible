@@ -11,10 +11,11 @@ Browser-based Kali Linux labs on AWS: Apache Guacamole behind an ALB connects to
 |---|---|
 | `cfn/01-network.yaml` | Deployed as stack `lab-network` in ap-southeast-1. |
 | `cfn/02-platform.yaml` | Deployed as stack `lab-platform` in ap-southeast-1. |
-| `cfn/03-storage.yaml` | Deployed as stack `lab-storage`; notes published; read-only policy applied by `scripts/apply-notes-policy.sh`. Read-only behaviour on a Kali client not yet verified (needs `20-class`). |
-| `ami/kali-firstboot.sh` | Written. Logic tested manually on a Kali instance. Not yet run through cloud-init. |
+| `cfn/03-storage.yaml` | Deployed as stack `lab-storage`; notes published; read-only policy applied by `scripts/apply-notes-policy.sh`. Read-only behaviour on a Kali client not yet verified. |
+| `ami/kali-firstboot.sh` | Written. Logic tested manually on a Kali instance. Runs from the class stack's user data; its results (hostname, notes mount) not yet checked on a deployed Kali. |
 | `cfn/10-database.yaml` | Deployed as stack `lab-database`. Ephemeral (per session). |
 | `cfn/11-web.yaml` | Deployed as stack `lab-web`; both targets healthy; admin login works after `scripts/db-run.sh init`. Ephemeral (per session). |
+| `cfn/20-class.yaml` | Deployed as stack `lab-class-pa31`; an RDP session from Guacamole to a Kali opens with no password prompt. Ephemeral (one stack per class). |
 
 ## Repo layout
 
@@ -25,11 +26,13 @@ cfn/
   03-storage.yaml    EFS for read-only lecture notes, mount targets, notes admin role
   10-database.yaml   RDS PostgreSQL for Guacamole (ephemeral, per session)
   11-web.yaml        Guacamole web ASG, target group, ALB listener rule (ephemeral, per session)
+  20-class.yaml      per class: guacd pool + internal NLB, one Kali per student index (ephemeral)
 ami/
   kali-firstboot.sh  user-data for Kali instances (password, compositor, hostname, notes mount)
 scripts/
   db-run.sh               runs db tasks (init / restore / dump) on a web node via SSM
   node/db-node.sh         the task itself; runs on the web node
+  deploy-class.sh         deploys/updates one class stack from Guacamole's connection list
   sync_guac.py            roster -> Guacamole users, connections, permissions (REST API)
   apply-notes-policy.sh   applies the read-only EFS policy after 03-storage is deployed
 params/
@@ -483,6 +486,7 @@ scripts/sync_guac.py roster/roster.csv --dry-run          # show the plan, chang
 scripts/sync_guac.py roster/roster.csv
 scripts/sync_guac.py --reset someone@example.com          # new password for one existing user
 scripts/sync_guac.py --show someone@example.com           # what can this user see? (read-only)
+scripts/sync_guac.py --list-class PA31                    # indexes with a connection, e.g. 1,2,3 (read-only)
 ```
 
 - **Users:** the email is the Guacamole username, with a random 14-character password. The roster name is stored as the user's full name (shown in the user menu after login) and the email as the email address. These are set when the user is created only.
@@ -500,3 +504,67 @@ scripts/sync_guac.py --show someone@example.com           # what can this user s
 
 - The web tier has two nodes and a Guacamole login token only exists on the node that issued it, so API calls must stay on one node. The script keeps the ALB stickiness cookie for this. Any other client calling the API (for example curl) needs a cookie jar (`-c` / `-b`), otherwise calls fail randomly with `403 Permission Denied`.
 - Status: tested against a live Guacamole: users, names, connections, per-user visibility and re-running without changes. The connection itself has not been opened yet (needs the class stack with guacd and Kali).
+
+---
+
+## 20-class.yaml
+
+Ephemeral stack, one per class (`lab-class-pa31`, `lab-class-pa32`, `lab-class-pa33`), deployed with `scripts/deploy-class.sh`. Requires `lab-network`, `lab-platform` and `lab-storage`. Classes are independent: start and delete them one at a time. Delete a class stack first in the teardown order, after `db-run.sh dump`.
+
+### What it builds
+
+| Resource | Detail |
+|---|---|
+| Internal NLB | Fixed address `10.0.<class>.10`, TCP 4822, in the class subnet; security group `lab-guacd-nlb-sg` (4822 from the web nodes only) |
+| guacd pool | Auto Scaling group in the class subnet, default 2 x `c6i.large`, Amazon Linux 2023 with the pinned `guacamole/guacd` container, TCP health check on 4822 |
+| Kali desktops | One EC2 instance per student index at `10.0.<class>.(100+index)`, from the golden AMI, client security group (RDP from guacd only), public IP for outbound internet only, instance metadata tags on, no instance profile |
+
+- The Kali user data is `ami/kali-firstboot.sh`. `deploy-class.sh` gzips and base64-encodes it into a parameter (about 2 KB, limit 4096) and the instance decodes and runs it, with `EFS_ID` and `REGION` supplied by the template. Root volume size is the AMI's own.
+- CloudFormation has no arithmetic and the loop value cannot be used as a `FindInMap` key (the first deploy attempt failed on exactly that), so `deploy-class.sh` does the arithmetic: it converts each index to its last octet (`100 + index`, the same rule as `sync_guac.py`) and passes the octets to the stack.
+- The Kali instances are created by a loop (`Fn::ForEach`, transform `AWS::LanguageExtensions`) over the `KaliHostOctets` parameter, with the loop value read inside the body as `!Ref Octet`, which is the form AWS documents (a quoted `${Octet}` string is replaced only in the resource name and in `Fn::Sub` strings, not inside `Fn::Join`; the second deploy attempt failed on that). Instances are named `pa<class>-<last octet>` (for example `pa31-101` for student index 1); the first-boot script uses that as the hostname.
+
+### Parameters
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `ClassOctet` | none | `31`, `32` or `33` (PA31, PA32, PA33). `deploy-class.sh` sets it from the class you name |
+| `KaliHostOctets` | none | Comma-separated last octets (101 to 254), one Kali each. `deploy-class.sh` builds it from the indexes in Guacamole (every connection in the class) |
+| `KaliAmiId` | none | From `LAB_KALI_AMI_ID` in `params/lab.env`; different labs can use different images |
+| `KaliInstanceType` | `t3.small` | `KALI_INSTANCE_TYPE` |
+| `GuacdInstanceType` | `c6i.large` | `GUACD_INSTANCE_TYPE`; compute-optimised x86, avoid burstable types for guacd |
+| `GuacdMinSize` / `GuacdMaxSize` | `2` / `2` | `GUACD_COUNT` |
+| `GuacdImage` | `guacamole/guacd:1.6.0` | Keep in step with the web image |
+
+### Deploy
+
+```bash
+source params/lab.env            # needs LAB_KALI_AMI_ID
+scripts/deploy-class.sh PA31                  # every student with a connection
+scripts/deploy-class.sh PA31 --indexes 1,2,3  # only these (for tests)
+scripts/deploy-class.sh PA31 --extra-script labs/web-sec.sh   # optional lab-specific commands
+```
+
+Order in a session: database, web, `db-run.sh restore`, `sync_guac.py`, then this. The script prints the plan (count, indexes, addresses) and asks for confirmation. Re-running it after the roster grows adds the new Kali and leaves the others alone. Anyone with a connection gets a Kali; revoke exceptions in the Guacamole admin UI.
+
+`--extra-script` is optional (nothing changes without it). The file is appended to `kali-firstboot.sh` and runs after it, in the same shell as root, with `set -u` still on; the combined, compressed script must stay under 4096 characters (about 2 KB is used by the first-boot script alone) and the script stops with an error if it does not. User data runs only at an instance's first boot, so if the script differs from the one in the running stack, `deploy-class.sh` warns that every Kali instance will be replaced (student files lost) and asks for a second confirmation.
+
+### Checking the template
+
+`cfn-lint` cannot expand a loop whose list is a parameter, so it reports the loop placeholders as errors. To lint the loop body, expand it by hand for a few indexes and lint the result; the last such check was clean (only the expected "parameter not used" warning).
+
+### Teardown
+
+```bash
+scripts/db-run.sh dump
+aws cloudformation delete-stack --region "$AWS_REGION" --stack-name lab-class-pa31
+```
+
+### Verified
+
+- A student connection opened from Guacamole reaches the Kali through the NLB and a guacd node, and logs in with no password prompt at the RDP screen (the connection carries the shared `kali` login).
+
+### Not yet verified
+
+- xrdp session reattach after a disconnect.
+- The read-only notes mount on a Kali (writes must be refused), and the hostname set from the instance Name tag.
+- Load: guacd CPU with a full class of simultaneous sessions.
