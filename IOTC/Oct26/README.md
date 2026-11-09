@@ -12,7 +12,7 @@ Browser-based Kali Linux labs on AWS: Apache Guacamole behind an ALB connects to
 | `cfn/01-network.yaml` | Deployed as stack `lab-network` in ap-southeast-1. |
 | `cfn/02-platform.yaml` | Deployed as stack `lab-platform` in ap-southeast-1. |
 | `cfn/03-storage.yaml` | Deployed as stack `lab-storage`; notes published; read-only policy applied by `scripts/apply-notes-policy.sh`. On a Kali, the notes are read-only: refused by the `ro` mount and, tested separately, by the EFS policy itself. |
-| `ami/kali-firstboot.sh` | Written. Logic tested manually on a Kali instance. Runs from the class stack's user data; hostname and notes mount verified on a deployed Kali. |
+| `ami/kali-firstboot.sh` | Written. Logic tested manually on a Kali instance. Runs from the class stack's user data; hostname and notes mount verified on a deployed Kali; DNS step added after a new AMI failed to resolve the EFS name (not yet re-tested on a fresh deploy). |
 | `cfn/10-database.yaml` | Deployed as stack `lab-database`. Ephemeral (per session). |
 | `cfn/11-web.yaml` | Deployed as stack `lab-web`; both targets healthy; admin login works after `scripts/db-run.sh init`. Ephemeral (per session). |
 | `cfn/20-class.yaml` | Deployed as stack `lab-class-pa31`; an RDP session from Guacamole to a Kali opens with no password prompt. Ephemeral (one stack per class). |
@@ -28,10 +28,11 @@ cfn/
   11-web.yaml        Guacamole web ASG, target group, ALB listener rule (ephemeral, per session)
   20-class.yaml      per class: guacd pool + internal NLB, one Kali per student index (ephemeral)
 ami/
-  kali-firstboot.sh  user-data for Kali instances (password, compositor, hostname, notes mount)
+  kali-firstboot.sh  user-data for Kali instances (password, compositor, hostname, DNS, notes mount)
 scripts/
   db-run.sh               runs db tasks (init / restore / dump) on a web node via SSM
   node/db-node.sh         the task itself; runs on the web node
+  spin-up.sh              starts a session: database, web, restore, roster sync, classes
   teardown.sh             ends a session safely: dump, then delete class, web and database stacks
   deploy-class.sh         deploys/updates one class stack from Guacamole's connection list
   sync_guac.py            roster -> Guacamole users, connections, permissions (REST API)
@@ -467,6 +468,7 @@ source params/lab.env
 scripts/db-run.sh init                    # empty database: load schema, set guacadmin password
 scripts/db-run.sh restore [file-name]     # empty database: restore newest (or named) dump, set guacadmin password
 scripts/db-run.sh dump                    # write s3://<dump bucket>/dumps/guacamole-<timestamp>.sql.gz
+scripts/db-run.sh restore-if-empty        # as restore, but does nothing if the database already has tables (also init-if-empty)
 ```
 
 - `init` and `restore` refuse to run if the database already has tables.
@@ -520,7 +522,7 @@ Ephemeral stack, one per class (`lab-class-pa31`, `lab-class-pa32`, `lab-class-p
 | guacd pool | Auto Scaling group in the class subnet, default 3 x `c6i.large`, Amazon Linux 2023 with the pinned `guacamole/guacd` container, TCP health check on 4822 |
 | Kali desktops | One EC2 instance per student index at `10.0.<class>.(100+index)`, from the golden AMI, client security group (RDP from guacd only), public IP for outbound internet only, instance metadata tags on, no instance profile |
 
-- The Kali user data is `ami/kali-firstboot.sh`. `deploy-class.sh` gzips and base64-encodes it into a parameter (about 2 KB, limit 4096) and the instance decodes and runs it, with `EFS_ID` and `REGION` supplied by the template. Root volume size is the AMI's own.
+- The Kali user data is `ami/kali-firstboot.sh`. `deploy-class.sh` gzips and base64-encodes it into a parameter (about 2.6 KB, limit 4096) and the instance decodes and runs it, with `EFS_ID` and `REGION` supplied by the template. Root volume size is the AMI's own.
 - CloudFormation has no arithmetic and the loop value cannot be used as a `FindInMap` key (the first deploy attempt failed on exactly that), so `deploy-class.sh` does the arithmetic: it converts each index to its last octet (`100 + index`, the same rule as `sync_guac.py`) and passes the octets to the stack.
 - The Kali instances are created by a loop (`Fn::ForEach`, transform `AWS::LanguageExtensions`) over the `KaliHostOctets` parameter, with the loop value read inside the body as `!Ref Octet`, which is the form AWS documents (a quoted `${Octet}` string is replaced only in the resource name and in `Fn::Sub` strings, not inside `Fn::Join`; the second deploy attempt failed on that). Instances are named `pa<class>-<last octet>` (for example `pa31-101` for student index 1); the first-boot script uses that as the hostname.
 
@@ -548,7 +550,7 @@ scripts/deploy-class.sh PA31 --extra-script labs/web-sec.sh   # optional lab-spe
 
 Order in a session: database, web, `db-run.sh restore`, `sync_guac.py`, then this. The script prints the plan (count, indexes, addresses) and asks for confirmation. Re-running it after the roster grows adds the new Kali and leaves the others alone. Anyone with a connection gets a Kali; revoke exceptions in the Guacamole admin UI.
 
-`--extra-script` is optional (nothing changes without it). The file is appended to `kali-firstboot.sh` and runs after it, in the same shell as root, with `set -u` still on; the combined, compressed script must stay under 4096 characters (about 2 KB is used by the first-boot script alone) and the script stops with an error if it does not. User data runs only at an instance's first boot, so if the script differs from the one in the running stack, `deploy-class.sh` warns that every Kali instance will be replaced (student files lost) and asks for a second confirmation.
+`--extra-script` is optional (nothing changes without it). The file is appended to `kali-firstboot.sh` and runs after it, in the same shell as root, with `set -u` still on; the combined, compressed script must stay under 4096 characters (about 2.6 KB is used by the first-boot script alone) and the script stops with an error if it does not. User data runs only at an instance's first boot, so if the script differs from the one in the running stack, `deploy-class.sh` warns that every Kali instance will be replaced (student files lost) and asks for a second confirmation.
 
 ### Checking the template
 
@@ -595,3 +597,38 @@ scripts/teardown.sh --all                    # dump, then delete all class stack
 - **Afterwards:** it lists the RDS final snapshots left behind. It never deletes them; remove old ones with `aws rds delete-db-snapshot`.
 - Status: tested with a stubbed AWS command (order of deletion, dump failure, no new dump file, tiny dump, class-only, nothing to delete, database without web, bad usage), and run with `--all` against the real account: dump, deletion in order and the snapshot listing all worked.
 - Each teardown leaves one RDS final snapshot, so they accumulate. Keep the newest as a safety net behind the S3 dump and delete older ones.
+
+---
+
+## Spin-up (`scripts/spin-up.sh`)
+
+Starts a session in one command. It is safe to re-run: stacks that already exist are kept, and the database is only loaded when it is empty. Needs `AWS_REGION`, `LAB_DOMAIN` and `LAB_KALI_AMI_ID` from `params/lab.env`.
+
+```bash
+source params/lab.env
+scripts/spin-up.sh --class PA31 --roster roster/roster.csv --dry-run   # show the plan
+scripts/spin-up.sh --class PA31 --roster roster/roster.csv
+scripts/spin-up.sh --class PA31 --class PA32 --guacd-count 3
+scripts/spin-up.sh --all-classes --roster roster/roster.csv
+```
+
+Steps, in order:
+
+1. Checks the permanent stacks are healthy, and that none of the stacks it needs is stuck in a failed state.
+2. Creates `lab-database` and `lab-web` if they do not exist, and waits until every web node is healthy (up to 15 minutes).
+3. Loads the database only if it is empty: the newest dump (`restore-if-empty`), or a fresh schema if no dump has ever been saved.
+4. With `--roster`: runs `sync_guac.py`, then dumps the database so the new students are saved at once (`--no-dump` skips that).
+5. Deploys each class with `deploy-class.sh` (every student with a connection gets a Kali).
+6. Prints the lab URL and where the new students' passwords are (`roster/out/credentials-*.csv`).
+
+Other options: `--guacd-count N`, `--kali-type T`, `--extra-script FILE` (passed through to the class stacks), `--yes`, `--dry-run`.
+
+- **No saved dump:** the script warns that it would create an empty user database (the usual cause of an unexpected empty database is a wrong bucket or region). Interactively it asks first; with `--yes` it refuses unless `--fresh` is also given.
+- **Adding a class later in a session:** run it again with the extra class; the existing stacks are kept and the database is left alone.
+- Status: tested with stubbed AWS and sibling scripts (order of steps, dry run, no dump, web never healthy, missing permanent stack, failed stack, re-run with everything up, no class given). Not yet run against the real account.
+
+### Notes from testing the Kali image
+
+- A newly built AMI did not pass the DHCP DNS server to `systemd-resolved` (`resolvectl status` showed no DNS servers on `eth0`), so every lookup returned `REFUSED` and the notes mount failed with the misleading "Resource temporarily unavailable" (the NFS client's wording for a temporary name-resolution failure). `kali-firstboot.sh` now points `systemd-resolved` at the Amazon-provided resolver (`169.254.169.253`) before mounting the notes. Only that resolver resolves EFS names.
+- The notes mount line in `/etc/fstab` is now replaced on every boot instead of being added only when missing, so an AMI built from a Kali that already had the notes mounted cannot carry a stale file system ID.
+- Changing the first-boot script changes the user data, so updating an existing class stack replaces its Kali instances (`deploy-class.sh` warns). For a test, tear down and spin up again.
