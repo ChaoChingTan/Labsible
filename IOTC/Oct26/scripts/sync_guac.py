@@ -23,6 +23,7 @@ Needs: AWS CLI configured, LAB_DOMAIN and AWS_REGION in the environment (params/
   scripts/sync_guac.py roster/roster.csv
   scripts/sync_guac.py --reset alice@example.com      # new password for one user
   scripts/sync_guac.py --show alice@example.com       # what can this user see? (read-only)
+  scripts/sync_guac.py --list-class PA31              # indexes with a connection, e.g. 1,2,3 (read-only)
 """
 import argparse, csv, datetime, json, os, re, secrets, subprocess, sys
 import http.cookiejar, urllib.error, urllib.parse, urllib.request
@@ -141,6 +142,7 @@ def main():
     ap.add_argument("--out-dir", default="roster/out")
     ap.add_argument("--reset", metavar="EMAIL", help="set a new random password for one existing user")
     ap.add_argument("--show", metavar="EMAIL", help="list what one user can see and do (diagnostic, read-only)")
+    ap.add_argument("--list-class", metavar="CLASS", help="print the student indexes (comma-separated) of every connection in a class, e.g. PA31 (read-only)")
     ap.add_argument("--url", help="base URL (default https://$LAB_DOMAIN)")
     a = ap.parse_args()
 
@@ -148,6 +150,18 @@ def main():
     base = a.url or ("https://" + (os.environ.get("LAB_DOMAIN") or sys.exit("LAB_DOMAIN not set")))
     api = Api(base, admin_password(region))
     stamp = datetime.datetime.now().strftime("%Y-%m-%dT%H%M%S")  # time included: never overwrite an earlier run's passwords
+
+    if a.list_class:
+        cls = a.list_class.strip().upper()
+        if not CLASS_RE.match(cls):
+            sys.exit(f"bad class '{cls}' (use PA31, PA32 or PA33)")
+        found = []
+        for c in api._call("GET", api.d("/connections")).values():
+            m = CONN_RE.match(c.get("name", ""))
+            if m and m.group(1) == cls:
+                found.append(int(m.group(2)))
+        print(",".join(str(i) for i in sorted(set(found))))
+        return
 
     if a.show:
         email = a.show.strip().lower()
