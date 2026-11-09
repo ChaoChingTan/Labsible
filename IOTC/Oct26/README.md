@@ -516,7 +516,7 @@ Ephemeral stack, one per class (`lab-class-pa31`, `lab-class-pa32`, `lab-class-p
 | Resource | Detail |
 |---|---|
 | Internal NLB | Fixed address `10.0.<class>.10`, TCP 4822, in the class subnet; security group `lab-guacd-nlb-sg` (4822 from the web nodes only) |
-| guacd pool | Auto Scaling group in the class subnet, default 2 x `c6i.large`, Amazon Linux 2023 with the pinned `guacamole/guacd` container, TCP health check on 4822 |
+| guacd pool | Auto Scaling group in the class subnet, default 3 x `c6i.large`, Amazon Linux 2023 with the pinned `guacamole/guacd` container, TCP health check on 4822 |
 | Kali desktops | One EC2 instance per student index at `10.0.<class>.(100+index)`, from the golden AMI, client security group (RDP from guacd only), public IP for outbound internet only, instance metadata tags on, no instance profile |
 
 - The Kali user data is `ami/kali-firstboot.sh`. `deploy-class.sh` gzips and base64-encodes it into a parameter (about 2 KB, limit 4096) and the instance decodes and runs it, with `EFS_ID` and `REGION` supplied by the template. Root volume size is the AMI's own.
@@ -532,7 +532,7 @@ Ephemeral stack, one per class (`lab-class-pa31`, `lab-class-pa32`, `lab-class-p
 | `KaliAmiId` | none | From `LAB_KALI_AMI_ID` in `params/lab.env`; different labs can use different images |
 | `KaliInstanceType` | `t3.small` | `KALI_INSTANCE_TYPE` |
 | `GuacdInstanceType` | `c6i.large` | `GUACD_INSTANCE_TYPE`; compute-optimised x86, avoid burstable types for guacd |
-| `GuacdMinSize` / `GuacdMaxSize` | `2` / `2` | `GUACD_COUNT` |
+| `GuacdMinSize` / `GuacdMaxSize` | `3` / `3` | Both set from `GUACD_COUNT` or `--guacd-count N` (default 3; about $0.10/hr per node) |
 | `GuacdImage` | `guacamole/guacd:1.6.0` | Keep in step with the web image |
 
 ### Deploy
@@ -541,6 +541,7 @@ Ephemeral stack, one per class (`lab-class-pa31`, `lab-class-pa32`, `lab-class-p
 source params/lab.env            # needs LAB_KALI_AMI_ID
 scripts/deploy-class.sh PA31                  # every student with a connection
 scripts/deploy-class.sh PA31 --indexes 1,2,3  # only these (for tests)
+scripts/deploy-class.sh PA31 --guacd-count 2  # fewer guacd nodes for a small test
 scripts/deploy-class.sh PA31 --extra-script labs/web-sec.sh   # optional lab-specific commands
 ```
 
